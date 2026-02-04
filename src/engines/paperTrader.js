@@ -12,24 +12,26 @@ export class PaperTrader {
   }
 
   loadState() {
-    try {
-      if (fs.existsSync(STATE_FILE)) {
-        return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      }
-    } catch (err) {
-      console.error("Failed to load paper state:", err);
-    }
-
-    return {
+    const defaultState = {
       balance: CONFIG.paper.initialBalance,
       position: null, // { side: 'UP'|'DOWN', amount: 10, entryPrice: 0.50, shares: 20, marketSlug: '...' }
       dailyLoss: 0,
       lastStopLossTime: 0,
       recentResults: [], // ['WIN', 'LOSS', ...]
-      recentResults: [], // ['WIN', 'LOSS', ...]
       lastDailyReset: Date.now(),
       lastExitTime: 0 // Track when we last closed a position
     };
+
+    try {
+      if (fs.existsSync(STATE_FILE)) {
+        const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+        return { ...defaultState, ...loaded };
+      }
+    } catch (err) {
+      console.error("Failed to load paper state:", err);
+    }
+
+    return defaultState;
   }
 
   saveState() {
