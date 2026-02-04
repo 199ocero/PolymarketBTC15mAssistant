@@ -3,7 +3,7 @@ import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
 import { startChainlinkPriceStream } from "./data/chainlinkWs.js";
 import { startPolymarketChainlinkPriceStream } from "./data/polymarketLiveWs.js";
-import { logSignalToDb } from "./db.js";
+import { logSignalToDb, getWinStats } from "./db.js";
 import {
   fetchMarketBySlug,
   fetchLiveEventsBySeriesId,
@@ -852,6 +852,25 @@ async function main() {
          return kv("Daily PnL:", `${color}${sign}$${Math.abs(pnl).toFixed(2)}${ANSI.reset} (Loss Limit: $${CONFIG.paper.dailyLossLimit})`);
       })();
 
+      // WIN RATE
+      const winStats = await getWinStats();
+      const winValues = (() => {
+        const { totalAll, winsAll, totalToday, winsToday } = winStats;
+        
+        const rateAll = totalAll > 0 ? (winsAll / totalAll) * 100 : 0;
+        const rateToday = totalToday > 0 ? (winsToday / totalToday) * 100 : 0;
+
+        const colorAll = rateAll >= 50 ? ANSI.green : rateAll > 0 ? ANSI.red : ANSI.gray;
+        const colorToday = rateToday >= 50 ? ANSI.green : rateToday > 0 ? ANSI.red : ANSI.gray;
+
+        // Overall: 65% (13/20) | Today: 100% (2/2)
+        const strAll = `${colorAll}${rateAll.toFixed(0)}%${ANSI.reset} (${winsAll}/${totalAll})`;
+        const strToday = `${colorToday}${rateToday.toFixed(0)}%${ANSI.reset} (${winsToday}/${totalToday})`;
+
+        return `Overall ${strAll} | Today ${strToday}`;
+      })();
+      const winRateLine = kv("Win Rate:", winValues);
+
       const lines = [
         titleLine,
         marketLine,
@@ -872,9 +891,14 @@ async function main() {
         kv("SIGNAL:", signalLine),
         kv("CONVICTION:", strengthLine),
         kv("ADVICE:", adviceLine),
+        "",
+        sepLine(),
+        "",
+        section("─ PAPER ACCOUNT ─"),
         totalEquityLine,
         paperBalanceLine,
         dailyPnlLine,
+        winRateLine,
         "",
         sepLine(),
         "",

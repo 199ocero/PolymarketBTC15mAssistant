@@ -134,3 +134,41 @@ export function logPaperTradeToDb(data) {
     });
   });
 }
+
+export function getWinStats() {
+  return new Promise((resolve, reject) => {
+    // We want two aggregates:
+    // 1. Overall: count(*) as total, sum(case when pnl > 0 then 1 else 0 end) as wins
+    // 2. Today: same but where timestamp >= today_start
+    
+    // SQLite doesn't have complex date functions easily available without extensions sometimes, 
+    // but ISO strings sort/compare well.
+    
+    const now = new Date();
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())).toISOString();
+
+    const query = `
+      SELECT 
+        COUNT(*) as total_all,
+        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins_all,
+        SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as total_today,
+        SUM(CASE WHEN timestamp >= ? AND pnl > 0 THEN 1 ELSE 0 END) as wins_today
+      FROM paper_trades
+      WHERE pnl IS NOT NULL
+    `;
+
+    db.get(query, [todayStart, todayStart], (err, row) => {
+      if (err) {
+        console.error("Error fetching win stats:", err);
+        resolve({ totalAll: 0, winsAll: 0, totalToday: 0, winsToday: 0 }); // Fail safe
+      } else {
+        resolve({
+          totalAll: row?.total_all || 0,
+          winsAll: row?.wins_all || 0,
+          totalToday: row?.total_today || 0,
+          winsToday: row?.wins_today || 0
+        });
+      }
+    });
+  });
+}

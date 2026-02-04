@@ -1,18 +1,21 @@
 {
-  "balance": 119.69080933170714,
+  "balance": 126.37062387903346,
   "position": null,
-  "dailyLoss": -19.690809331707165,
-  "lastStopLossTime": 1770215767500,
+  "dailyLoss": -26.37062387903352,
+  "lastStopLossTime": 1770222662951,
   "recentResults": [
     "WIN",
     "WIN",
     "WIN",
+    "WIN",
+    "WIN",
+    "WIN",
+    "WIN",
     "LOSS",
-    "WIN",
-    "WIN",
-    "WIN"
+    "LOSS",
+    "LOSS"
   ],
   "lastDailyReset": 1770214928049,
-  "lastExitTime": 1770217335354,
-  "consecutiveLosses": 0
+  "lastExitTime": 1770222662954,
+  "consecutiveLosses": 3
 }
