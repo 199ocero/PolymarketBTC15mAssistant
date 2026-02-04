@@ -3,6 +3,7 @@ import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
 import { startChainlinkPriceStream } from "./data/chainlinkWs.js";
 import { startPolymarketChainlinkPriceStream } from "./data/polymarketLiveWs.js";
+import { logSignalToDb } from "./db.js";
 import {
   fetchMarketBySlug,
   fetchLiveEventsBySeriesId,
@@ -202,7 +203,20 @@ function getBtcSession(now = new Date()) {
 function parsePriceToBeat(market) {
   const text = String(market?.question ?? market?.title ?? "");
   if (!text) return null;
-  const m = text.match(/price\s*to\s*beat[^\d$]*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  
+  // 1. Explicit "Price to beat"
+  let m = text.match(/price\s*to\s*beat[^\d$]*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  
+  // 2. "> Value" (e.g. BTC > 100,000)
+  if (!m) {
+    m = text.match(/>\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/);
+  }
+
+  // 3. "Above Value"
+  if (!m) {
+    m = text.match(/above\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]+)?)/i);
+  }
+
   if (!m) return null;
   const raw = m[1].replace(/,/g, "");
   const n = Number(raw);
@@ -282,6 +296,12 @@ const marketCache = {
   fetchedAtMs: 0
 };
 
+const orderBookCache = {
+  up: null,
+  down: null,
+  fetchedAtMs: 0
+};
+
 async function resolveCurrentBtc15mMarket() {
   if (CONFIG.polymarket.marketSlug) {
     return await fetchMarketBySlug(CONFIG.polymarket.marketSlug);
@@ -290,7 +310,10 @@ async function resolveCurrentBtc15mMarket() {
   if (!CONFIG.polymarket.autoSelectLatest) return null;
 
   const now = Date.now();
-  if (marketCache.market && now - marketCache.fetchedAtMs < CONFIG.pollIntervalMs) {
+  // Use heavyFetchIntervalMs for market metadata instead of pollIntervalMs
+  const expiration = CONFIG.polymarket.heavyFetchIntervalMs || 5000;
+  
+  if (marketCache.market && now - marketCache.fetchedAtMs < expiration) {
     return marketCache.market;
   }
 
@@ -351,14 +374,40 @@ async function fetchPolymarketSnapshot() {
   let downBookSummary = { bestBid: null, bestAsk: null, spread: null, bidLiquidity: null, askLiquidity: null };
 
   try {
-    const [yesBuy, noBuy, upBook, downBook] = await Promise.all([
+    const promises = [
       fetchClobPrice({ tokenId: upTokenId, side: "buy" }),
-      fetchClobPrice({ tokenId: downTokenId, side: "buy" }),
-      fetchOrderBook({ tokenId: upTokenId }),
-      fetchOrderBook({ tokenId: downTokenId })
-    ]);
+      fetchClobPrice({ tokenId: downTokenId, side: "buy" })
+    ];
+
+    // Only fetch orderbook if cache expired
+    const now = Date.now();
+    const obExpiration = CONFIG.polymarket.heavyFetchIntervalMs || 5000;
+    const shouldFetchBook = now - orderBookCache.fetchedAtMs > obExpiration;
+
+    if (shouldFetchBook) {
+        promises.push(fetchOrderBook({ tokenId: upTokenId }));
+        promises.push(fetchOrderBook({ tokenId: downTokenId }));
+    }
+
+    const results = await Promise.all(promises);
+    const yesBuy = results[0];
+    const noBuy = results[1];
+    
+    let upBook, downBook;
+
+    if (shouldFetchBook) {
+        upBook = results[2];
+        downBook = results[3];
+        orderBookCache.up = upBook;
+        orderBookCache.down = downBook;
+        orderBookCache.fetchedAtMs = now;
+    } else {
+        upBook = orderBookCache.up;
+        downBook = orderBookCache.down;
+    }
 
     upBuy = yesBuy;
+    downBook = downBook; // fix naming if needed? No, logic below uses summaries.
     downBuy = noBuy;
     upBookSummary = summarizeOrderBook(upBook);
     downBookSummary = summarizeOrderBook(downBook);
@@ -406,25 +455,8 @@ async function main() {
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
   const signalState = { lastSide: null, lastTime: 0 };
   const paper = new PaperTrader();
-
-  const header = [
-    "timestamp",
-    "entry_minute",
-    "time_left_min",
-    "regime",
-    "signal",
-    "model_up",
-    "model_down",
-    "mkt_up",
-    "mkt_down",
-    "edge_up",
-    "edge_down",
-    "recommendation",
-    "price_to_beat",
-    "current_price",
-    "binance_price",
-    "gap"
-  ];
+  let lastStrikeCheckTime = 0;
+  let consecutiveErrors = 0;
 
   while (true) {
     const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
@@ -453,23 +485,26 @@ async function main() {
         fetchPolymarketSnapshot()
       ]);
 
-      // 0. CHECK FOR MANUAL STRIKE OVERRIDE
+      // 0. CHECK FOR MANUAL STRIKE OVERRIDE (Poll every 5s)
       const strikeFile = "strike.txt";
-      if (fs.existsSync(strikeFile)) {
-        try {
-          const content = fs.readFileSync(strikeFile, "utf8").trim();
-          const overridePrice = parseFloat(content.replace(/,/g, ""));
-          // Validation: Must be number, positive, and vaguely realistic for BTC (e.g. > 1000) or 0-1 for others? 
-          // Assuming user knows what they are doing.
-          if (Number.isFinite(overridePrice) && overridePrice > 0) {
-              if (priceToBeatState.value !== overridePrice) {
-                 priceToBeatState = { slug: poly.market?.slug || "manual", value: overridePrice, setAtMs: Date.now() };
-              }
+      if (Date.now() - lastStrikeCheckTime > 5000) {
+        lastStrikeCheckTime = Date.now();
+        if (fs.existsSync(strikeFile)) {
+          try {
+            const content = fs.readFileSync(strikeFile, "utf8").trim();
+            const overridePrice = parseFloat(content.replace(/,/g, ""));
+            if (Number.isFinite(overridePrice) && overridePrice > 0) {
+                if (priceToBeatState.value !== overridePrice) {
+                  priceToBeatState = { slug: poly.market?.slug || "manual", value: overridePrice, setAtMs: Date.now() };
+                }
+            }
+          } catch (err) {
+              // ignore
           }
-        } catch (err) {
-            // ignore
         }
       }
+
+
 
       const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
       const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
@@ -530,11 +565,25 @@ async function main() {
       }
 
       if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
-        const nowMs = Date.now();
-        const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-        if (okToLatch) {
-          priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
-        }
+          // 1. Try to recover from metadata (Fix for Restarts)
+          const metaStrike = priceToBeatFromPolymarketMarket(poly.market);
+          
+          if (metaStrike !== null && Number.isFinite(metaStrike)) {
+             priceToBeatState = { 
+                slug: priceToBeatState.slug, 
+                value: metaStrike, 
+                setAtMs: Date.now() 
+             };
+             // console.log(`[Strike] Recovered strike from metadata: ${metaStrike}`);
+          } 
+          // 2. Fallback to Latching (Only if metadata failed AND we are live)
+          else {
+             const nowMs = Date.now();
+             const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
+             if (okToLatch) {
+                priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
+             }
+          }
       }
 
       const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
@@ -568,7 +617,8 @@ async function main() {
 
 
 
-      const timeAware = applyTimeAwareness(scored.rawUp, timeLeftMin, CONFIG.candleWindowMinutes);
+      // Time awareness removed to allow trades at any time based on TA signal
+      const timeAware = { timeDecay: 1, adjustedUp: scored.rawUp, adjustedDown: 1 - scored.rawUp };
 
       const marketUp = poly.ok ? poly.prices.up : null;
       const marketDown = poly.ok ? poly.prices.down : null;
@@ -583,27 +633,31 @@ async function main() {
       if (!Number.isFinite(rec.probability)) rec.probability = 0.5; // Fallback
 
 
-      // TIME GUARD: Block entries in the first N minutes (Volatility Filter)
-      if (timeLeftMin !== null && timeLeftMin > (15 - CONFIG.paper.timeGuardMinutes) && rec.action === "ENTER") {
-          rec.action = "HOLD";
-          rec.reason = `WAITING_VOLATILITY (< ${CONFIG.paper.timeGuardMinutes}m)`;
-      }
-
-      // END GUARD: Block entries in the last N minutes (Too Late)
-      if (timeLeftMin !== null && timeLeftMin < CONFIG.paper.entryDeadlineMinutes && rec.action === "ENTER") {
-          rec.action = "HOLD";
-          rec.reason = `TOO_LATE_TO_ENTER (< ${CONFIG.paper.entryDeadlineMinutes}m)`;
-      }
+      // TIME GUARD Removed
+      // END GUARD Removed
 
       // Update Paper Trader
-      paper.update({
+      await paper.update({
           signal: scored,
           rec,
           prices: poly.ok ? poly.prices : { up: null, down: null },
           market: poly.ok ? poly.market : null,
-          tokens: poly.ok ? poly.tokens : null
+          tokens: poly.ok ? poly.tokens : null,
+          trend: (() => {
+               if (closes.length < 6) return "FLAT";
+               const cNow = closes[closes.length - 1];
+               const cPast = closes[closes.length - 6]; // 5 mins ago
+               return cNow > cPast ? "RISING" : "FALLING";
+          })()
       });
       const paperPnL = paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null });
+
+      const trendLabel = (() => {
+           if (closes.length < 6) return "FLAT";
+           const cNow = closes[closes.length - 1];
+           const cPast = closes[closes.length - 6];
+           return cNow > cPast ? "RISING" : "FALLING";
+      })();
 
       const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
 
@@ -649,12 +703,20 @@ async function main() {
       const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
       const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
 
+      const blockingReason = rec.action === "ENTER" ? paper.getBlockingReason(rec.side, trendLabel) : null;
+      
       const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
 
       const signalColor = rec.action === "ENTER" ? (rec.side === "UP" ? ANSI.green : ANSI.red) : ANSI.gray;
-      const signalLine = rec.action === "ENTER"
-        ? `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} (${rec.phase} ENTRY)`
-        : `${ANSI.gray}WAITING FOR EDGE...${ANSI.reset}`;
+      
+      let signalLine = `${ANSI.gray}WAITING FOR EDGE...${ANSI.reset}`;
+      if (rec.action === "ENTER") {
+          if (blockingReason) {
+              signalLine = `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} ${ANSI.red}(BLOCKED: ${blockingReason})${ANSI.reset}`;
+          } else {
+              signalLine = `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} (${rec.phase} ENTRY)`;
+          }
+      }
 
       const strengthColor = rec.strength === "STRONG" ? ANSI.green : rec.strength === "GOOD" ? ANSI.yellow : ANSI.gray;
       const edgeValue = rec.edge !== null ? formatPct(rec.edge, 1) : "0%";
@@ -666,16 +728,20 @@ async function main() {
         : "-";
 
       let adviceLine = `${ANSI.gray}Analyzing market momentum...${ANSI.reset}`;
-      if (timeLeftMin !== null && timeLeftMin < 3) {
+      if (timeLeftMin !== null && timeLeftMin < 2) {
         adviceLine = `${ANSI.yellow}⚠️ LATE STAGE: Volatility high. Avoid new entries.${ANSI.reset}`;
       } else if (rec.action === "ENTER") {
-        if (signalState.lastSide && signalState.lastSide !== rec.side && (Date.now() - signalState.lastTime < 600000)) {
+        if (blockingReason) {
+            adviceLine = `${ANSI.red}Trade blocked. Resolve: ${blockingReason}${ANSI.reset}`;
+        } else if (signalState.lastSide && signalState.lastSide !== rec.side && (Date.now() - signalState.lastTime < 600000)) {
           adviceLine = `${ANSI.lightRed}🚨 REVERSAL: Close previous ${signalState.lastSide} position NOW!${ANSI.reset}`;
         } else {
           adviceLine = rec.side === "UP" ? "Bullish edge detected. Look for entry." : "Bearish edge detected. Look for entry.";
         }
-        signalState.lastSide = rec.side;
-        signalState.lastTime = Date.now();
+        if (!blockingReason) {
+             signalState.lastSide = rec.side;
+             signalState.lastTime = Date.now();
+        }
       } else if (signalState.lastSide) {
         adviceLine = `${ANSI.gray}Previous signal (${signalState.lastSide}) weakened.${ANSI.reset}`;
       }
@@ -799,11 +865,22 @@ async function main() {
         sepLine(),
         "",
         kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+        (() => {
+            const currentPnL = paperPnL || 0;
+            const totalEquity = paper.state.balance + (paper.state.position ? currentPnL : 0);
+            const lifetimePnL = totalEquity - CONFIG.paper.initialBalance;
+            const lifetimeColor = lifetimePnL >= 0 ? ANSI.green : ANSI.red;
+            const sign = lifetimePnL >= 0 ? "+" : "-";
+            
+            return kv("Total Equity:", `$${formatNumber(totalEquity, 2)} (${lifetimeColor}${sign}$${Math.abs(lifetimePnL).toFixed(2)}${ANSI.reset})`);
+        })(),
         kv("Paper Balance:", `$${formatNumber(paper.state.balance, 2)} ` + (paper.state.position
            ? `(${paper.state.position.side} ${formatNumber(paper.state.position.shares, 1)}sh)`
            : "(Flat)")
-           + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
+           + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(Pos PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
         ),
+        kv("BTC Trend (5m):", trendLabel === "RISING" ? `${ANSI.green}RISING${ANSI.reset}` : `${ANSI.red}FALLING${ANSI.reset}`),
+        kv("Daily Net Loss:", `$${(paper.state.dailyLoss || 0).toFixed(2)} / $${CONFIG.paper.dailyLossLimit}`),
         "",
         sepLine(),
         centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
@@ -814,31 +891,51 @@ async function main() {
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
 
-      appendCsvRow("./logs/signals.csv", header, [
-        new Date().toISOString(),
-        timing.elapsedMinutes.toFixed(3),
-        timeLeftMin.toFixed(3),
-        regimeInfo.regime,
-        signal,
-        timeAware.adjustedUp,
-        timeAware.adjustedDown,
-        marketUp,
-        marketDown,
-        edge.edgeUp,
-        edge.edgeDown,
-        rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE",
-        priceToBeat,
-        lastPrice,
-        spotPrice,
-        gap
-      ]);
+      await logSignalToDb({
+        entry_minute: timing.elapsedMinutes,
+        time_left_min: timeLeftMin,
+        regime: regimeInfo.regime,
+        signal: signal,
+        model_up: timeAware.adjustedUp,
+        model_down: timeAware.adjustedDown,
+        mkt_up: marketUp,
+        mkt_down: marketDown,
+        edge_up: edge.edgeUp,
+        edge_down: edge.edgeDown,
+        recommendation: rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE",
+        price_to_beat: priceToBeat,
+        current_price: lastPrice,
+        binance_price: spotPrice,
+        gap: gap
+      });
+      
+      consecutiveErrors = 0; // Reset on success
+
     } catch (err) {
+      consecutiveErrors++;
       console.log("────────────────────────────");
       console.log(`Error: ${err?.message ?? String(err)}`);
+      console.log(`(Consecutive Errors: ${consecutiveErrors}/5)`);
       console.log("────────────────────────────");
+      
+      if (consecutiveErrors >= 5) {
+          console.log("Too many consecutive errors. Exiting for restart...");
+          process.exit(1);
+      }
     }
 
     await sleep(CONFIG.pollIntervalMs);
+
+    // Manual Garbage Collection (Safety Valve)
+    // Run every ~60 seconds (assuming 1s sleep + other work)
+    if (global.gc && Date.now() % 60000 < 2000) {
+       try {
+         // console.log("Running manual Garbage Collection...");
+         global.gc(); 
+       } catch (e) {
+         // ignore
+       }
+    }
   }
 }
 

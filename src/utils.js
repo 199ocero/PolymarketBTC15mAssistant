@@ -43,25 +43,64 @@ export function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-export function appendCsvRow(filePath, header, row) {
+const streamCache = new Map();
+
+function getLogStream(filePath) {
+  if (streamCache.has(filePath)) return streamCache.get(filePath);
+
   ensureDir(path.dirname(filePath));
-  const exists = fs.existsSync(filePath);
-  const line = row
-    .map((v) => {
-      if (v === null || v === undefined) return "";
-      const s = String(v);
-      if (s.includes(",") || s.includes("\n") || s.includes('"')) {
-        return `"${s.replaceAll('"', '""')}"`;
-      }
-      return s;
-    })
-    .join(",");
+  const stream = fs.createWriteStream(filePath, { flags: "a", encoding: "utf8" });
+  
+  stream.on("error", (err) => {
+    console.error(`Stream error for ${filePath}:`, err);
+    streamCache.delete(filePath); // Invalidate on error to retry next time
+  });
 
-  if (!exists) {
-    const content = line ? `${header.join(",")}\n${line}\n` : `${header.join(",")}\n`;
-    fs.writeFileSync(filePath, content, "utf8");
-    return;
-  }
-
-  fs.appendFileSync(filePath, `${line}\n`, "utf8");
+  streamCache.set(filePath, stream);
+  return stream;
 }
+
+export function appendCsvRow(filePath, header, row) {
+  try {
+    const exists = fs.existsSync(filePath);
+    
+    const line = row
+      .map((v) => {
+        if (v === null || v === undefined) return "";
+        const s = String(v);
+        if (s.includes(",") || s.includes("\n") || s.includes('"')) {
+          return `"${s.replaceAll('"', '""')}"`;
+        }
+        return s;
+      })
+      .join(",");
+
+    const stream = getLogStream(filePath);
+    
+    // If file didn't exist (or was deleted), we might need to write header.
+    // However, with persistent stream, checking existsSync might be flaky if stream created the file.
+    // A simple heuristic: if we just created the stream, we might check stats?
+    // Actually, simple approach: check size? 
+    // fs.existsSync is cheap-ish.
+    
+    // Better: if file is empty, write header.
+    // We can use fs.statSync to check size 0, but handle error if not exists.
+    let isNew = !exists;
+    try {
+        const stats = fs.statSync(filePath);
+        if (stats.size === 0) isNew = true;
+    } catch {
+        isNew = true;
+    }
+
+    if (isNew) {
+      stream.write(`${header.join(",")}\n`);
+    }
+
+    stream.write(`${line}\n`);
+    
+  } catch (err) {
+    console.error(`Failed to write to ${filePath}:`, err.message);
+  }
+}
+

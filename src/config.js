@@ -1,6 +1,6 @@
 export const CONFIG = {
   symbol: "BTCUSDT",
-  binanceBaseUrl: "https://api.binance.com",
+  binanceBaseUrl: "https://data-api.binance.vision",
   gammaBaseUrl: "https://gamma-api.polymarket.com",
   clobBaseUrl: "https://clob.polymarket.com",
 
@@ -22,7 +22,8 @@ export const CONFIG = {
     autoSelectLatest: (process.env.POLYMARKET_AUTO_SELECT_LATEST || "true").toLowerCase() === "true",
     liveDataWsUrl: process.env.POLYMARKET_LIVE_WS_URL || "wss://ws-live-data.polymarket.com",
     upOutcomeLabel: process.env.POLYMARKET_UP_LABEL || "Up",
-    downOutcomeLabel: process.env.POLYMARKET_DOWN_LABEL || "Down"
+    downOutcomeLabel: process.env.POLYMARKET_DOWN_LABEL || "Down",
+    heavyFetchIntervalMs: 5_000 // New: Throttle heavy data (OrderBooks) to 5s
   },
 
   chainlink: {
@@ -37,12 +38,16 @@ export const CONFIG = {
     initialBalance: Number(process.env.PAPER_BALANCE) || 100,
     feePct: 2.0,
     takeProfitPrice: 0.95, // Legacy/Panic target (High)
-    takeProfitRoiPct: 20, // Buy 20c -> Sell 24c
-    stopLossRoiPct: 25,   // Buy 50c -> Sell 37.5c
+    takeProfitRoiPct: 30, // Widen from ~20 to 30% (User req)
+    stopLossRoiPct: 15,   // Tighten from ~25 to 15% (User req)
     timeGuardMinutes: 3,
     kellyFraction: 0.25, // Quarter Kelly
     minBet: 5,
     maxBet: 10,
+    cooldownMinutes: 0, // New: 0m cooldown (Disabled by user request)
+    entryCooldownSeconds: 60, // Cooldown after exit before re-entering
+    dailyLossLimit: 10.0, // New: Max daily loss
+    stopLossGracePeriodSeconds: 60, // New: 60s grace period for Stop Loss
     entryDeadlineMinutes: 4 // End Guard (Don't enter in last 4 mins)
   }
 };
