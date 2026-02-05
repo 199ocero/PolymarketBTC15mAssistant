@@ -3,7 +3,7 @@ import { fetchKlines, fetchLastPrice } from "./data/binance.js";
 import { fetchChainlinkBtcUsd } from "./data/chainlink.js";
 import { startChainlinkPriceStream } from "./data/chainlinkWs.js";
 import { startPolymarketChainlinkPriceStream } from "./data/polymarketLiveWs.js";
-import { logSignalToDb, getWinStats } from "./db.js";
+import { logSignalToDb, getWinStats, getRecentTrades } from "./db.js";
 import {
   fetchMarketBySlug,
   fetchLiveEventsBySeriesId,
@@ -28,6 +28,9 @@ import path from "node:path";
 import readline from "node:readline";
 import { applyGlobalProxyFromEnv } from "./net/proxy.js";
 import { PaperTrader } from "./engines/paperTrader.js";
+import express from "express";
+import { createServer } from "node:http";
+import { WebSocketServer, WebSocket } from "ws";
 
 function countVwapCrosses(closes, vwapSeries, lookback) {
   if (closes.length < lookback || vwapSeries.length < lookback) return null;
@@ -42,6 +45,33 @@ function countVwapCrosses(closes, vwapSeries, lookback) {
 }
 
 applyGlobalProxyFromEnv();
+
+// --- WEB SERVER & WS SETUP ---
+const app = express();
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+app.use(express.static("public"));
+
+const clients = new Set();
+wss.on("connection", (ws) => {
+  clients.add(ws);
+  ws.on("close", () => clients.delete(ws));
+});
+
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`\x1b[36m[System] Web Dashboard starting at http://localhost:${PORT}\x1b[0m`);
+});
 
 function fmtTimeLeft(mins) {
   const totalSeconds = Math.max(0, Math.floor(mins * 60));
@@ -455,9 +485,34 @@ async function main() {
   let prevCurrentPrice = null;
   let priceToBeatState = { slug: null, value: null, setAtMs: null };
   const signalState = { lastSide: null, lastTime: 0 };
-  const paper = new PaperTrader();
+  
+  const activityLog = [];
+  let lastLogMsg = null;
+  const pushActivity = (msg) => {
+    if (msg === lastLogMsg) return;
+    lastLogMsg = msg;
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    activityLog.push(`${ANSI.gray}[${timestamp}]${ANSI.reset} ${msg}`);
+    if (activityLog.length > 8) activityLog.shift();
+    
+    // Broadcast to Web UI
+    let type = 'default';
+    if (msg.includes('WIN')) type = 'win';
+    else if (msg.includes('LOSS')) type = 'loss';
+    else if (msg.includes('System')) type = 'system';
+    
+    broadcast({ type: 'activity', payload: { msg, type } });
+  };
+
+  const paper = new PaperTrader(pushActivity);
   let lastStrikeCheckTime = 0;
   let consecutiveErrors = 0;
+
+  if (process.stdout.isTTY) {
+    console.clear();
+  }
+
+  pushActivity(`System: PolyBot Dashboard Live at http://localhost:${PORT}`);
 
   while (true) {
     const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
@@ -540,6 +595,10 @@ async function main() {
 
       const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
       
+      // New: Calculate Gap
+      const spotPrice = wsPrice ?? lastPrice;
+      const gap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
+
       // Calculate 5-minute EMA (based on 1m candles)
       const ema5 = computeEma(closes, 5); 
       const lastPriceForEma = spotPrice ?? lastPrice;
@@ -559,9 +618,6 @@ async function main() {
       const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
       const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
 
-      // New: Calculate Gap
-      const spotPrice = wsPrice ?? lastPrice;
-      const gap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
 
       const currentPrice = chainlink?.price ?? null;
       const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
@@ -859,7 +915,10 @@ async function main() {
       })();
 
       // WIN RATE
-      const winStats = await getWinStats();
+      const [winStats, recentTrades] = await Promise.all([
+        getWinStats(),
+        getRecentTrades(5)
+      ]);
       const winValues = (() => {
         const { totalAll, winsAll, totalToday, winsToday } = winStats;
         
@@ -920,13 +979,65 @@ async function main() {
         "",
         sepLine(),
         "",
-        kv("ET | Session:", `${ANSI.white}${fmtEtTime(new Date())}${ANSI.reset} | ${ANSI.white}${getBtcSession(new Date())}${ANSI.reset}`),
+        section("─ ACTIVITY FEED ─"),
+        ...activityLog,
         "",
         sepLine(),
         centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
       ].filter((x) => x !== null);
 
-      renderScreen(lines.join("\n") + "\n");
+      renderScreen(lines.join("\n"));
+
+      // --- BROADCAST TO WEB UI ---
+      broadcast({
+        type: "state",
+        payload: {
+          marketName: poly.ok ? (poly.market?.question || poly.market?.title) : "Polymarket Active",
+          marketSlug: poly.ok ? poly.market?.slug : "-",
+          timeLeftStr: fmtTimeLeft(timeLeftMin),
+          timeLeftMin: timeLeftMin,
+          etTime: fmtEtTime(new Date()),
+          session: getBtcSession(new Date()),
+          
+          side: rec.side,
+          phase: rec.phase,
+          conviction: rec.edge || 0,
+          advice: stripAnsi(adviceLine),
+          
+          binancePrice: spotPrice,
+          currentPrice: currentPrice,
+          strikePrice: priceToBeat,
+          gap: gap,
+          polyUp: marketUp,
+          polyDown: marketDown,
+          
+          totalEquity: paper.state.balance + (paper.state.position ? paperPnL : 0),
+          dailyPnl: -(paper.state.dailyLoss || 0),
+          paperBalance: paper.state.balance,
+          winStats: {
+            overall: {
+              rate: Number(winStats.totalAll) > 0 ? (Number(winStats.winsAll) / Number(winStats.totalAll)) * 100 : 0,
+              wins: Number(winStats.winsAll),
+              total: Number(winStats.totalAll)
+            },
+            today: {
+              rate: Number(winStats.totalToday) > 0 ? (Number(winStats.winsToday) / Number(winStats.totalToday)) * 100 : 0,
+              wins: Number(winStats.winsToday),
+              total: Number(winStats.totalToday)
+            }
+          },
+          
+          position: paper.state.positions && paper.state.positions.length > 0 ? paper.state.positions[0] : null,
+          posPnl: paperPnL,
+          
+          indHeiken: { val: heikenValue, sentiment: haNarrative === "LONG" ? "LONG" : haNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
+          indRsi: { val: rsiValue, sentiment: rsiNarrative === "LONG" ? "LONG" : rsiNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
+          indMacd: { val: macdLabel, sentiment: macdNarrative === "LONG" ? "LONG" : macdNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
+          indVwap: { val: vwapValue, sentiment: vwapNarrative === "LONG" ? "LONG" : vwapNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
+          indEma: { val: emaLabel, sentiment: emaTrend === "UP" ? "LONG" : emaTrend === "DOWN" ? "SHORT" : "NEUTRAL" },
+          recentTrades: recentTrades
+        }
+      });
 
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
@@ -953,13 +1064,10 @@ async function main() {
 
     } catch (err) {
       consecutiveErrors++;
-      console.log("────────────────────────────");
-      console.log(`Error: ${err?.message ?? String(err)}`);
-      console.log(`(Consecutive Errors: ${consecutiveErrors}/5)`);
-      console.log("────────────────────────────");
+      pushActivity(`${ANSI.red}ERROR:${ANSI.reset} ${err?.message ?? String(err)} (${consecutiveErrors}/5)`);
       
       if (consecutiveErrors >= 5) {
-          console.log("Too many consecutive errors. Exiting for restart...");
+          pushActivity(`${ANSI.red}CRITICAL: Too many consecutive errors. Exiting...${ANSI.reset}`);
           process.exit(1);
       }
     }
@@ -978,5 +1086,25 @@ async function main() {
     }
   }
 }
+
+const restoreCursor = () => {
+  if (process.stdout.isTTY) {
+    process.stdout.write("\x1b[?25h"); // Show cursor
+  }
+};
+
+process.on("SIGINT", () => {
+  restoreCursor();
+  process.exit();
+});
+
+process.on("SIGTERM", () => {
+  restoreCursor();
+  process.exit();
+});
+
+process.on("exit", () => {
+  restoreCursor();
+});
 
 main();

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PolyBot Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-mode">
+    <div id="app">
+        <header>
+            <div class="header-content">
+                <div class="brand">
+                    <div class="logo">PB</div>
+                    <h1>PolyBot <span class="version">v0.1.0</span></h1>
+                </div>
+                <div class="market-info">
+                    <h2 id="market-name">Loading market...</h2>
+                    <div class="market-meta">
+                        <span id="market-slug">-</span>
+                        <span class="divider">|</span>
+                        <span id="market-time-left" class="time-left">00:00</span>
+                    </div>
+                </div>
+                <div class="connection-status">
+                    <span id="status-dot" class="dot"></span>
+                    <span id="status-text">Disconnected</span>
+                </div>
+            </div>
+        </header>
+
+        <main class="dashboard-grid">
+            <!-- LEFT COLUMN: Account, Market & Signal -->
+            <div class="column-left">
+                <!-- TOP ROW: Account & Signal -->
+                <div class="top-row">
+                    <!-- 1. ACCOUNT CARD -->
+                    <div class="card account-card">
+                        <div class="card-header">
+                            <h3>Paper Account</h3>
+                            <div id="session-name" class="badge">Session: -</div>
+                        </div>
+                        <div class="equity-hero">
+                            <label>Total Market Equity</label>
+                            <div id="total-equity" class="value">$0,000.00</div>
+                        </div>
+                        <div class="stat-grid">
+                            <div class="stat-item">
+                                <label>Today's P/L</label>
+                                <div id="daily-pnl" class="value">$0.00</div>
+                            </div>
+                            <div class="stat-item">
+                                <label>Balance</label>
+                                <div id="paper-balance" class="value">$0.00</div>
+                            </div>
+                            <div class="stat-item">
+                                <label>Win (Day)</label>
+                                <div id="win-rate-today" class="value">0%</div>
+                            </div>
+                            <div class="stat-item">
+                                <label>Win (All)</label>
+                                <div id="win-rate-total" class="value">0%</div>
+                            </div>
+                            <div class="stat-item">
+                                <label>Unrealized</label>
+                                <div id="unrealized-pnl" class="value">$0.00</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 2. SIGNAL CARD -->
+                    <div class="card signal-card">
+                        <div class="card-header">
+                            <h3>Trading Signal</h3>
+                            <div id="signal-phase" class="badge">-</div>
+                        </div>
+                        <div class="signal-body">
+                            <div id="signal-side" class="side-neutral">NO TRADE</div>
+                            <div class="conviction-container">
+                                <div class="conviction-labels">
+                                    <label>Conviction</label>
+                                    <span id="conviction-pct">0%</span>
+                                </div>
+                                <div class="progress-bg">
+                                    <div id="conviction-progress" class="progress-fill" style="width: 0%"></div>
+                                </div>
+                            </div>
+                            <div id="advice-line" class="advice">Analyzing...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- MIDDLE ROW: Pricing & Indicators -->
+                <div class="middle-row">
+                    <!-- 3. PRICE CARD -->
+                    <div class="card price-card">
+                        <h3>Market Pricing</h3>
+                        <div class="price-grid">
+                            <div class="price-item">
+                                <label>Binance BTC</label>
+                                <div id="binance-price" class="value">$--,---</div>
+                            </div>
+                            <div class="price-item">
+                                <label>Chainlink BTC</label>
+                                <div id="current-price" class="value">$--,---</div>
+                            </div>
+                            <div class="price-item">
+                                <label>Gap</label>
+                                <div id="price-gap" class="value">+$0.00</div>
+                            </div>
+                            <div class="price-item streak">
+                                <label>Price to Beat</label>
+                                <div id="strike-price" class="value">$--,---</div>
+                            </div>
+                        </div>
+                        <div class="poly-prices">
+                            <div class="poly-badge buy-up">
+                                <span>UP</span> <strong id="poly-up">--¢</strong>
+                            </div>
+                            <div class="poly-badge buy-down">
+                                <span>DOWN</span> <strong id="poly-down">--¢</strong>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 4. INDICATORS CARD -->
+                    <div class="card indicators-card">
+                        <h3>TA Indicators</h3>
+                        <div class="indicator-list">
+                            <div class="ind-item">
+                                <span>HA</span>
+                                <span id="ind-heiken" class="ind-val neutral">-</span>
+                            </div>
+                            <div class="ind-item">
+                                <span>RSI</span>
+                                <span id="ind-rsi" class="ind-val neutral">-</span>
+                            </div>
+                            <div class="ind-item">
+                                <span>MACD</span>
+                                <span id="ind-macd" class="ind-val neutral">-</span>
+                            </div>
+                            <div class="ind-item">
+                                <span>VWAP</span>
+                                <span id="ind-vwap" class="ind-val neutral">-</span>
+                            </div>
+                            <div class="ind-item">
+                                <span>EMA (5)</span>
+                                <span id="ind-ema" class="ind-val neutral">-</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- RIGHT COLUMN: Trades & Activity -->
+            <div class="column-right">
+                <!-- LATEST TRADES -->
+                <div class="card trades-card">
+                    <h3>Recent Trades</h3>
+                    <div id="recent-trades-list" class="trades-container">
+                        <div class="no-trades">No settled trades yet</div>
+                    </div>
+                </div>
+
+                <!-- ACTIVITY FEED -->
+                <div class="card log-card">
+                    <div class="card-header">
+                        <h3>System Activity</h3>
+                        <button id="clear-logs">Clear</button>
+                    </div>
+                    <div id="activity-feed" class="log-container">
+                        <div class="log-entry system">System ready...</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <div class="footer-content">
+                <div class="timing">
+                    <span id="et-time">--:--:-- ET</span>
+                    <span id="footer-session-name">-</span>
+                </div>
+                <div class="credits">created by @krajekis</div>
+            </div>
+        </footer>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

@@ -8,8 +8,17 @@ import { sendDiscordNotification } from "../net/discord.js";
 const STATE_FILE = "./src/state/paperState.json";
 
 export class PaperTrader {
-  constructor() {
+  constructor(logger = null) {
     this.state = this.loadState();
+    this.logger = logger;
+  }
+
+  log(msg) {
+    if (this.logger) {
+      this.logger(msg);
+    } else {
+      console.log(msg);
+    }
   }
 
   loadState() {
@@ -19,7 +28,6 @@ export class PaperTrader {
       dailyLoss: 0,
       lastStopLossTime: 0,
       recentResults: [], // ['WIN', 'LOSS', ...]
-      lastDailyReset: Date.now(),
       lastDailyReset: Date.now(),
       lastExitTime: 0,
       lastEntryTime: 0, // Track when we last opened a position
@@ -96,7 +104,7 @@ export class PaperTrader {
     const now = new Date();
     // Reset if day changed (UTC)
     if (last.getUTCDate() !== now.getUTCDate()) {
-      console.log(`[Paper] New day detected. Resetting Daily Loss (Prev: $${this.state.dailyLoss.toFixed(2)})`);
+      this.log(`[Paper] New day detected. Resetting Daily Loss (Prev: $${this.state.dailyLoss.toFixed(2)})`);
       this.state.dailyLoss = 0;
       this.state.lastDailyReset = now.getTime();
       this.saveState();
@@ -125,7 +133,7 @@ export class PaperTrader {
         if (roiPct >= 30 && !pos.hitBreakevenTrigger) {
             pos.hitBreakevenTrigger = true;
             this.saveState();
-            console.log(`[Paper] Breakeven Triggered (+${roiPct.toFixed(1)}%). Stop Loss moved to Entry: ${entryPrice.toFixed(2)}`);
+            this.log(`[Paper] Breakeven Triggered (+${roiPct.toFixed(1)}%). Stop Loss moved to Entry: ${entryPrice.toFixed(2)}`);
         }
 
         const slRoi = CONFIG.paper.stopLossRoiPct;
@@ -252,7 +260,7 @@ export class PaperTrader {
     this.state.lastExitTime = Date.now();
 
     this.saveState();
-    console.log(`[Paper] Closed ${side} at ${exitPrice} (${reason}). PnL: $${pnl.toFixed(2)} (Fee: $${fee.toFixed(2)}) DailyNetLoss: $${this.state.dailyLoss.toFixed(2)}`);
+    this.log(`[Paper] Closed ${side} at ${exitPrice} (${reason}). PnL: $${pnl.toFixed(2)} (Fee: $${fee.toFixed(2)}) DailyNetLoss: $${this.state.dailyLoss.toFixed(2)}`);
   }
 
   async handleEntrySignal(rec, side, strength, marketSlug, priceUp, priceDown, trend) {
@@ -270,13 +278,13 @@ export class PaperTrader {
     
     // 0. Price Guard (Lottery Ticket Prevention)
     if (normalizedPrice < CONFIG.paper.minEntryPrice || normalizedPrice > CONFIG.paper.maxEntryPrice) {
-        console.log(`[Paper] Blocked Entry: Price ${normalizedPrice.toFixed(2)} out of range (${CONFIG.paper.minEntryPrice}-${CONFIG.paper.maxEntryPrice})`);
+        this.log(`[Paper] Blocked Entry: Price ${normalizedPrice.toFixed(2)} out of range (${CONFIG.paper.minEntryPrice}-${CONFIG.paper.maxEntryPrice})`);
         return;
     }
 
     // 0b. Consecutive Loss Circuit Breaker
     if ((this.state.consecutiveLosses || 0) >= CONFIG.paper.maxConsecutiveLosses) {
-        console.log(`[Paper] Blocked Entry: Max consecutive losses reached (${this.state.consecutiveLosses}). Manual reset required.`);
+        this.log(`[Paper] Blocked Entry: Max consecutive losses reached (${this.state.consecutiveLosses}). Manual reset required.`);
         return; 
     }
 
@@ -288,7 +296,7 @@ export class PaperTrader {
     
     // Log Probability for debugging
     if (rec) {
-       console.log(`[Probability] Model: ${rec.probability?.toFixed(2)} Market: ${normalizedPrice.toFixed(2)} Edge: ${rec.edge?.toFixed(2)} Strength: ${strength}`);
+       this.log(`[Probability] Model: ${rec.probability?.toFixed(2)} Market: ${normalizedPrice.toFixed(2)} Edge: ${rec.edge?.toFixed(2)} Strength: ${strength}`);
     }
 
     // 1. Daily Loss Limit
@@ -395,7 +403,7 @@ export class PaperTrader {
     const marketPositions = this.state.positions.filter(p => p.marketSlug === marketSlug);
     if (marketPositions.length > 0) {
       if (marketPositions[0].side !== side) {
-        console.log(`[Paper] FLIPPING POSITIONS: ${marketPositions[0].side} -> ${side}`);
+        this.log(`[Paper] FLIPPING POSITIONS: ${marketPositions[0].side} -> ${side}`);
         for (const pos of marketPositions) {
             await this.closePosition(pos, (side === "UP" ? priceUp : priceDown), "FLIP_CLOSE");
         }
@@ -437,9 +445,9 @@ export class PaperTrader {
        });
 
        this.saveState();
-       console.log(`[Paper] Entered ${side} at ${entryPrice} (Amt: $${tradeAmount} + Fee: $${fee.toFixed(2)})`);
+       this.log(`[Paper] Entered ${side} at ${entryPrice} (Amt: $${tradeAmount} + Fee: $${fee.toFixed(2)})`);
     } else if (this.state.balance < tradeAmount) {
-      console.log("[Paper] Insufficient balance for trade.");
+      this.log("[Paper] Insufficient balance for trade.");
     }
   }
   getBlockingReason(side, trend) {

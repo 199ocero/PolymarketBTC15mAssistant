@@ -150,9 +150,9 @@ export function getWinStats() {
     const query = `
       SELECT 
         COUNT(*) as total_all,
-        SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins_all,
+        COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) as wins_all,
         SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as total_today,
-        SUM(CASE WHEN timestamp >= ? AND pnl > 0 THEN 1 ELSE 0 END) as wins_today
+        COALESCE(SUM(CASE WHEN timestamp >= ? AND pnl > 0 THEN 1 ELSE 0 END), 0) as wins_today
       FROM paper_trades
       WHERE pnl IS NOT NULL
     `;
@@ -162,12 +162,33 @@ export function getWinStats() {
         console.error("Error fetching win stats:", err);
         resolve({ totalAll: 0, winsAll: 0, totalToday: 0, winsToday: 0 }); // Fail safe
       } else {
+        console.log(`[DB Debug] WinStats: ${JSON.stringify(row)} (todayStart: ${todayStart})`);
         resolve({
           totalAll: row?.total_all || 0,
           winsAll: row?.wins_all || 0,
           totalToday: row?.total_today || 0,
           winsToday: row?.wins_today || 0
         });
+      }
+    });
+  });
+}
+
+export function getRecentTrades(limit = 5) {
+  return new Promise((resolve, reject) => {
+    const query = `
+      SELECT timestamp, side, price, amount, shares, pnl, action, market_slug
+      FROM paper_trades
+      WHERE pnl IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `;
+    db.all(query, [limit], (err, rows) => {
+      if (err) {
+        console.error("Error fetching recent trades:", err);
+        resolve([]);
+      } else {
+        resolve(rows || []);
       }
     });
   });
