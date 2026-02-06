@@ -174,12 +174,11 @@ export function getWinStats() {
   });
 }
 
-export function getRecentTrades(limit = 5) {
+export function getRecentTrades(limit = 10) {
   return new Promise((resolve, reject) => {
     const query = `
       SELECT timestamp, side, price, amount, shares, pnl, action, market_slug
       FROM paper_trades
-      WHERE pnl IS NOT NULL
       ORDER BY timestamp DESC
       LIMIT ?
     `;

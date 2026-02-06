@@ -56,10 +56,21 @@ app.use(express.static("public"));
 const clients = new Set();
 wss.on("connection", (ws) => {
   clients.add(ws);
+  
+  // Send last state immediately if available
+  if (lastState) {
+    ws.send(JSON.stringify(lastState));
+  }
+  
   ws.on("close", () => clients.delete(ws));
 });
 
+let lastState = null;
+
 function broadcast(data) {
+  if (data.type === "state") {
+    lastState = data;
+  }
   const msg = JSON.stringify(data);
   for (const client of clients) {
     if (client.readyState === WebSocket.OPEN) {
@@ -102,6 +113,7 @@ function sepLine(ch = "─") {
 }
 
 function renderScreen(text) {
+  /*
   try {
     readline.cursorTo(process.stdout, 0, 0);
     readline.clearScreenDown(process.stdout);
@@ -109,6 +121,7 @@ function renderScreen(text) {
     // ignore
   }
   process.stdout.write(text);
+  */
 }
 
 function stripAnsi(s) {
@@ -508,9 +521,11 @@ async function main() {
   let lastStrikeCheckTime = 0;
   let consecutiveErrors = 0;
 
+  /*
   if (process.stdout.isTTY) {
     console.clear();
   }
+  */
 
   pushActivity(`System: PolyBot Dashboard Live at http://localhost:${PORT}`);
 
@@ -917,7 +932,7 @@ async function main() {
       // WIN RATE
       const [winStats, recentTrades] = await Promise.all([
         getWinStats(),
-        getRecentTrades(5)
+        getRecentTrades(10)
       ]);
       const winValues = (() => {
         const { totalAll, winsAll, totalToday, winsToday } = winStats;

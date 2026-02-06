@@ -75,7 +75,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const entry = document.createElement('div');
         entry.className = `log-entry ${type}`;
         
-        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+        const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
         entry.innerHTML = `<span class="log-timestamp">[${ts}]</span> ${msg}`;
         
         elements.activityFeed.appendChild(entry);
@@ -93,8 +93,15 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.marketSlug.textContent = state.marketSlug || '-';
         elements.timeLeft.textContent = state.timeLeftStr || '00:00';
         
-        if (state.timeLeftMin < 5) elements.timeLeft.classList.add('pulsing');
-        else elements.timeLeft.classList.remove('pulsing');
+        // Dynamic Time Coloring
+        const mins = state.timeLeftMin || 0;
+        if (mins >= 10) {
+            elements.timeLeft.style.color = 'var(--accent-green)';
+        } else if (mins >= 5) {
+            elements.timeLeft.style.color = 'var(--accent-yellow)';
+        } else {
+            elements.timeLeft.style.color = 'var(--accent-red)';
+        }
 
         // Signal
         const side = state.side || 'NEUTRAL';
@@ -129,7 +136,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (elements.polyDown) elements.polyDown.textContent = state.polyDown !== null ? `${state.polyDown}¢` : '--¢';
 
         // Account
-        elements.totalEquity.textContent = `$${state.totalEquity?.toFixed(2) || '0.00'}`;
+        if (elements.totalEquity) {
+            const formattedEquity = state.totalEquity?.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            elements.totalEquity.textContent = `$${formattedEquity || '0.00'}`;
+            elements.totalEquity.style.color = state.dailyPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+        }
+        
         elements.dailyPnl.textContent = (state.dailyPnl >= 0 ? '+' : '-') + '$' + Math.abs(state.dailyPnl || 0).toFixed(2);
         elements.dailyPnl.style.color = state.dailyPnl >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
         elements.paperBalance.textContent = `$${state.paperBalance?.toFixed(2) || '0.00'}`;
@@ -181,20 +193,34 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         elements.tradesList.innerHTML = trades.map(t => {
-            const pnl = parseFloat(t.pnl) || 0;
-            const pnlColor = pnl > 0 ? 'var(--accent-green)' : 'var(--accent-red)';
-            const sign = pnl >= 0 ? '+' : '';
+            const hasPnl = t.pnl !== null && t.pnl !== undefined && t.pnl !== '';
+            const pnl = parseFloat(t.pnl);
+            const isProfit = hasPnl && pnl > 0;
+            const isLoss = hasPnl && pnl < 0;
+            
+            const pnlColor = isProfit ? 'var(--accent-green)' : isLoss ? 'var(--accent-red)' : 'var(--accent-blue)';
             const sideClass = t.side.toLowerCase();
-            const time = new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const time = new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            
+            // Format Display
+            let statusDisplay = `<span class="trade-side side-${sideClass}">${t.side}</span>`;
+            let pnlDisplay;
+            
+            if (hasPnl) {
+                const sign = pnl > 0 ? '+' : '';
+                pnlDisplay = `<span class="action-label">${t.action || 'CLOSE'}</span> ${sign}$${Math.abs(pnl).toFixed(2)}`;
+            } else {
+                pnlDisplay = `<span class="action-label">${t.action || 'OPEN'}</span> @ $${t.price.toFixed(2)}`;
+            }
             
             return `
                 <div class="trade-row">
                     <div class="trade-info">
-                        <span class="trade-side side-${sideClass}">${t.side}</span>
+                        ${statusDisplay}
                         <span class="trade-time">${time}</span>
                     </div>
                     <div class="trade-pnl" style="color: ${pnlColor}">
-                        ${sign}$${Math.abs(pnl).toFixed(2)}
+                        ${pnlDisplay}
                     </div>
                 </div>
             `;
