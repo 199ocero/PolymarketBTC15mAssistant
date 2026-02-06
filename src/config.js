@@ -7,13 +7,35 @@ export const CONFIG = {
   pollIntervalMs: 1_000,
   candleWindowMinutes: 15,
 
+  // Indicators
   vwapSlopeLookbackMinutes: 5,
   rsiPeriod: 14,
   rsiMaPeriod: 14,
-
   macdFast: 12,
   macdSlow: 26,
   macdSignal: 9,
+
+  // Strategy Specifics
+  strategy: {
+    momentum: {
+      rsiMin: 50,
+      rsiMax: 70, // for Uptrend check
+      rsiMinDown: 30, 
+      rsiMaxDown: 50, // for Downtrend check
+      minOddsEdge: 0.10, // 10%
+    },
+    meanReversion: {
+      rsiOverbought: 65,
+      rsiOversold: 35,
+      vwapDeviation: 0.003, // 0.3%
+      minTimeRemaining: 7,
+    },
+    lateWindow: {
+      maxTimeRemaining: 3,
+      minTimeRemaining: 1,
+      minOdds: 0.90, // safe barrier, if < 90% and good signal
+    }
+  },
 
   polymarket: {
     marketSlug: process.env.POLYMARKET_SLUG || "",
@@ -23,7 +45,7 @@ export const CONFIG = {
     liveDataWsUrl: process.env.POLYMARKET_LIVE_WS_URL || "wss://ws-live-data.polymarket.com",
     upOutcomeLabel: process.env.POLYMARKET_UP_LABEL || "Up",
     downOutcomeLabel: process.env.POLYMARKET_DOWN_LABEL || "Down",
-    heavyFetchIntervalMs: 5_000 // New: Throttle heavy data (OrderBooks) to 5s
+    heavyFetchIntervalMs: 5_000 
   },
 
   chainlink: {
@@ -36,25 +58,30 @@ export const CONFIG = {
 
   paper: {
     initialBalance: Number(process.env.PAPER_BALANCE) || 100,
-    feePct: 2.0,
-    takeProfitPrice: 0.95, // Legacy/Panic target (High)
-    takeProfitRoiPct: 30, // Widen from ~20 to 30% (User req)
+    feePct: 2.0, // Fallback if dynamic off
+    usePolymarketDynamicFees: true,
 
-    stopLossRoiPct: 20,   // Tightened to 20% (was 35%) per analysis recommendation
-    timeGuardMinutes: 3,
-    kellyFraction: 0.25, // Quarter Kelly
-    minBet: 5,
-    maxBet: 10,
-    cooldownMinutes: 2, // New: 2m cooldown after stop loss
-    entryCooldownSeconds: 15, // Reduced to 15s (Micro-debounce)
-    maxConcurrentPositions: 2, // The Power of 2: Balanced approach
-    penaltyBoxCooldownSeconds: 300, // 5 Minutes for Hard Losses
-    dailyLossLimit: 100.0, // Increased to 100 (was 10)daily loss
-    maxConsecutiveLosses: Number(process.env.PAPER_MAX_CONSECUTIVE_LOSSES) || 5, // New: Stop after N losses
-    minEntryPrice: 0.40, // New: Min price (Drift hunting $0.40-$0.60)
-    maxEntryPrice: 0.60, // New: Max price
-    stopLossGracePeriodSeconds: 15, // New: 15s grace period (was 60s) for Stop Loss
-    entryDeadlineMinutes: 4 // End Guard (Don't enter in last 4 mins)
+    // Execution / Risk
+    minBet: 3, // $3
+    maxBet: 5, // $5 (per trade position size)
+    maxConcurrentPositions: 2, // Power of 2
+    
+    // Stop Loss & Take Profit
+    // "Momentum: 15-20 cents", "MeanRev: 50-60 cents" -> Target fixed price usually
+    // Hard stop -40%
+    stopLossRoiPct: 40.0, 
+    takeProfitRoiPct: 100.0, // High ceiling, strategy exits logic handles dynamic TP (15c, 20c gain etc)
+    
+    // Limits
+    maxTradesPerDay: 12,
+    dailyLossLimit: 15.0, // -$15
+    
+    // Misc
+    breakevenTriggerRoiPct: 10.0, // maybe keep generic
+    timeGuardMinutes: 2, // "Exit all positions with 2 mins remaining"
+    
+    entryCooldownSeconds: 180, // "Wait at least 3 minutes between entering new trades"
+    stopLossGracePeriodSeconds: 15,
   },
   discord: {
     webhookUrl: process.env.DISCORD_WEBHOOK_URL || ""

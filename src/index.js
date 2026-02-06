@@ -614,10 +614,12 @@ async function main() {
       const spotPrice = wsPrice ?? lastPrice;
       const gap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
 
-      // Calculate 5-minute EMA (based on 1m candles)
-      const ema5 = computeEma(closes, 5); 
+      // Calculate EMAs for Scalp Strategy
+      const ema200 = computeEma(closes, 200); 
+      const ema21 = computeEma(closes, 21);
+      const ema9 = computeEma(closes, 9);
       const lastPriceForEma = spotPrice ?? lastPrice;
-      const emaTrend = ema5 !== null ? (lastPriceForEma > ema5 ? "UP" : "DOWN") : "NEUTRAL";
+      const emaTrend = ema21 !== null ? (lastPriceForEma > ema21 ? "RISING" : "FALLING") : "NEUTRAL";
 
       const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
       const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
@@ -700,9 +702,23 @@ async function main() {
 
       const marketUp = poly.ok ? poly.prices.up : null;
       const marketDown = poly.ok ? poly.prices.down : null;
-      const edge = computeEdge({ modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown, marketYes: marketUp, marketNo: marketDown });
-
-      const rec = decide({ remainingMinutes: timeLeftMin, edgeUp: edge.edgeUp, edgeDown: edge.edgeDown, modelUp: timeAware.adjustedUp, modelDown: timeAware.adjustedDown });
+      
+      // New Scalp Decide Call
+      const rec = decide({
+        trend: emaTrend, // uses EMA21 now
+        timeLeftMin,
+        spotPrice: currentPrice, // Use Chainlink/Live price
+        strikePrice: priceToBeat,
+        marketOdds: { up: marketUp, down: marketDown },
+        indicators: {
+            ema21,
+            ema9,
+            rsi: rsiNow,
+            macd,
+            heikinAshi: consec, // { color, count }
+            vwap: vwapNow
+        }
+      });
       rec.isExpired = (timeLeftMin !== null && timeLeftMin <= 0);
       rec.strikePrice = priceToBeat;
       rec.spotPrice = currentPrice;
@@ -777,8 +793,8 @@ async function main() {
       const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
       const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
 
-      const emaLabel = ema5 !== null ? `${formatNumber(ema5, 0)} (${emaTrend})` : "-";
-      const emaLine = formatNarrativeValue("EMA(5)", emaLabel, emaTrend === "UP" ? "LONG" : emaTrend === "DOWN" ? "SHORT" : "NEUTRAL");
+      const emaLabel = ema200 !== null ? `${formatNumber(ema200, 0)} (${emaTrend})` : "-";
+      const emaLine = formatNarrativeValue("EMA(200)", emaLabel, emaTrend === "RISING" ? "LONG" : emaTrend === "FALLING" ? "SHORT" : "NEUTRAL");
 
       const blockingReason = rec.action === "ENTER" ? paper.getBlockingReason(rec.side, emaTrend) : null;
       
@@ -1049,7 +1065,7 @@ async function main() {
           indRsi: { val: rsiValue, sentiment: rsiNarrative === "LONG" ? "LONG" : rsiNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
           indMacd: { val: macdLabel, sentiment: macdNarrative === "LONG" ? "LONG" : macdNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
           indVwap: { val: vwapValue, sentiment: vwapNarrative === "LONG" ? "LONG" : vwapNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
-          indEma: { val: emaLabel, sentiment: emaTrend === "UP" ? "LONG" : emaTrend === "DOWN" ? "SHORT" : "NEUTRAL" },
+          indEma: { val: emaLabel, sentiment: emaTrend === "RISING" ? "LONG" : emaTrend === "FALLING" ? "SHORT" : "NEUTRAL" },
           recentTrades: recentTrades
         }
       });

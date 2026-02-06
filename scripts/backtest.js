@@ -1,232 +1,249 @@
 import sqlite3 from "sqlite3";
 import path from "node:path";
+import fs from "node:fs";
+import { computeEma } from "../src/indicators/ema.js";
+import { computeRsi, sma, slopeLast } from "../src/indicators/rsi.js";
+import { computeMacd } from "../src/indicators/macd.js";
+import { computeHeikenAshi, countConsecutive } from "../src/indicators/heikenAshi.js";
+import { computeSessionVwap, computeVwapSeries } from "../src/indicators/vwap.js";
+import { evaluateScalpDetails } from "../src/engines/scalpStrategy.js";
+import { CONFIG } from "../src/config.js";
 
 const DB_PATH = path.resolve("./logs/trading_data.db");
 
-// --- CONFIG TO TEST ---
-const CONFIG = {
-    initialBalance: 1000,
-    minEntryPrice: 0.40,   // Updated
-    maxEntryPrice: 0.60,   // Updated
-    stopLossRoiPct: 20,    // Updated to 20%
-    takeProfitRoiPct: 80,  // Early exit if > 80%
-    takeProfitPrice: 0.92, // Early exit if > 0.92
-    stopLossGracePeriodSeconds: 15,
-    feePct: 2.0,
-    maxConsecutiveLosses: 5
-};
+if (!fs.existsSync(DB_PATH)) {
+  console.error("No database found at", DB_PATH);
+  process.exit(1);
+}
 
 const db = new sqlite3.Database(DB_PATH);
 
-function getAllSignals() {
-    return new Promise((resolve, reject) => {
-        db.all("SELECT * FROM signals ORDER BY timestamp ASC", (err, rows) => {
-            if (err) reject(err);
-            else resolve(rows);
-        });
+async function fetchAllSignals() {
+  return new Promise((resolve, reject) => {
+    db.all("SELECT * FROM signals ORDER BY timestamp ASC", (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
     });
+  });
 }
 
-// EMA Helper for backtest
-function computeEma(values, period) {
-  if (values.length < period) return null;
-  const k = 2 / (period + 1);
-  let ema = values[0];
-  for (let i = 1; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
-  }
-  return ema;
-}
+// Mock Paper Trader for Backtest
+const paperState = {
+  balance: 100,
+  positions: [],
+  dailyLoss: 0,
+  trades: []
+};
 
+// Main Backtest Loop
 async function runBacktest() {
-    console.log("Loading signals...");
-    const signals = await getAllSignals();
-    console.log(`Loaded ${signals.length} signals.`);
+  console.log("Loading history...");
+  const rows = await fetchAllSignals();
+  console.log(`Loaded ${rows.length} rows.`);
 
-    let balance = CONFIG.initialBalance;
-    let positions = []; // Array of { side, entryPrice, shares, amount, entryTime, marketStrike, hitBreakevenTrigger }
-    let trades = [];
-    let consecutiveLosses = 0;
-    let priceHistory = [];
-    let lastExitTime = 0;
-    let lastEntryTime = 0; // New for Phase 5
+  if (rows.length === 0) return;
 
-    for (let i = 0; i < signals.length; i++) {
-        const row = signals[i];
-        const ts = new Date(row.timestamp).getTime();
-        const spot = row.binance_price || row.current_price;
+  // 1. Candlestick Aggregation (1-minute candles)
+  const candles = [];
+  let currentCandle = null;
+
+  const getMinute = (ts) => Math.floor(new Date(ts).getTime() / 60000);
+
+  let lastMinute = -1;
+  
+  console.log("Starting Simulation...");
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const ts = new Date(row.timestamp).getTime();
+    const min = Math.floor(ts / 60000);
+    const price = row.binance_price || row.current_price;
+
+    if (!price) continue;
+
+    // Candle Building
+    if (min !== lastMinute) {
+      if (currentCandle) {
+        candles.push(currentCandle);
+      }
+      currentCandle = {
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume: 100, 
+        time: min * 60000
+      };
+      lastMinute = min;
+    } else {
+      if (currentCandle) {
+        currentCandle.high = Math.max(currentCandle.high, price);
+        currentCandle.low = Math.min(currentCandle.low, price);
+        currentCandle.close = price;
+      }
+    }
+
+    // Need enough candles for indicators (e.g. 26+ for MACD, 21 for EMA)
+    if (candles.length < 30) continue; 
+
+    const relevantCandles = candles; // Use all or slice if memory issue
+    const closes = relevantCandles.map(c => c.close);
+    
+    // Indicators
+    const ema21 = computeEma(closes, 21);
+    const ema9 = computeEma(closes, 9);
+    const ema200 = computeEma(closes, 200); // For trend
+    const rsi = computeRsi(closes, 14);
+    
+    // MACD
+    const macd = computeMacd(closes, 12, 26, 9);
+    
+    // Heikin Ashi
+    const ha = computeHeikenAshi(relevantCandles);
+    const consec = countConsecutive(ha);
+    
+    // VWAP
+    const vwap = computeSessionVwap(relevantCandles.slice(-60)); // 1 hour VWAP proxy
+
+    const trend = (ema21 && price > ema21) ? "RISING" : "FALLING";
+
+    // Prepare Context
+    const context = {
+        trend,
+        timeLeftMin: row.time_left_min,
+        spotPrice: price,
+        strikePrice: row.price_to_beat,
+        marketOdds: { up: row.mkt_up, down: row.mkt_down },
+        indicators: {
+            ema21,
+            ema9,
+            rsi,
+            macd,
+            heikinAshi: consec,
+            vwap
+        }
+    };
+
+    // DECIDE
+    const rec = evaluateScalpDetails(context);
+
+    // SIMULATE PAPER TRADER with Rec
+    updatePaperTrader(rec, row, price);
+  }
+
+  console.log("--- Backtest Complete ---");
+  console.log("Final Balance:", paperState.balance.toFixed(2));
+  console.log("Total Trades:", paperState.trades.length);
+  const wins = paperState.trades.filter(t => t.pnl > 0).length;
+  console.log(`Win Rate: ${wins}/${paperState.trades.length} (${paperState.trades.length > 0 ? (wins/paperState.trades.length*100).toFixed(1) : 0}%)`);
+  
+  if (paperState.trades.length > 0) {
+      console.table(paperState.trades);
+  } else {
+      console.log("No trades executed.");
+  }
+}
+
+function updatePaperTrader(rec, row, price) {
+    const { positions } = paperState;
+    const timeLeftMin = row.time_left_min;
+
+    // 1. Check Exits
+    for (let i = positions.length - 1; i >= 0; i--) {
+        const pos = positions[i];
+        const marketOdds = pos.side === "UP" ? row.mkt_up : row.mkt_down;
         
-        priceHistory.push(spot);
-        if (priceHistory.length > 500) priceHistory.shift();
+        if (!marketOdds) continue;
 
-        // 1. CHECK MARKET CONTINUITY / EXPIRY
-        if (positions.length > 0) {
-            const strikeChanged = row.price_to_beat !== null && positions[0].marketStrike !== null && row.price_to_beat !== positions[0].marketStrike;
-            
-            if (strikeChanged) {
-                const activeOnes = [...positions];
-                for (const pos of activeOnes) {
-                    const win = pos.side === "UP" ? spot >= pos.marketStrike : spot < pos.marketStrike;
-                    const payout = win ? 1.0 : 0.0;
-                    closePosition(pos, payout, "EXPIRY_SETTLEMENT", ts, row);
-                    // lastExitTime NOT set for expiry
-                }
-                positions = []; 
-            }
+        const pnlRaw = (marketOdds * pos.shares) - pos.amount;
+        // const roi = pnlRaw / pos.amount;
+        
+        let shouldExit = false;
+        let reason = "";
+
+        // Strategy Specific Exits
+        if (pos.strategy === "MOMENTUM") {
+            const priceGain = marketOdds - pos.entryPrice;
+            if (priceGain >= 0.15) { shouldExit = true; reason = "TP_MOM (15c)"; }
+            if (timeLeftMin <= 2) { shouldExit = true; reason = "TIME 2m"; }
+        } else if (pos.strategy === "MEAN_REVERSION") {
+            if (marketOdds >= 0.50) { shouldExit = true; reason = "TP_REV (50c)"; }
+            if (timeLeftMin <= 3) { shouldExit = true; reason = "TIME 3m"; }
+        } else if (pos.strategy === "LATE_WINDOW") {
+            // Hold
         }
 
-        // 2. UPDATE POSITIONS STATUS (SL / TP / HALF-TIME / BREAKEVEN)
-        if (positions.length > 0) {
-             const activeOnes = [...positions];
-             for (const pos of activeOnes) {
-                 const optPrice = pos.side === "UP" ? row.mkt_up : row.mkt_down;
-                 
-                 if (optPrice !== null && optPrice > 0) {
-                     const normPrice = optPrice > 1.05 ? optPrice / 100 : optPrice;
-                     const roi = (normPrice - pos.entryPrice) / pos.entryPrice;
-                     const roiPct = roi * 100;
-                     const secondsSinceEntry = (ts - pos.entryTime) / 1000;
-                     const timeLeft = row.time_left_min;
-                     
-                     // BREAKEVEN TRIGGER (+30% ROI)
-                     if (roiPct >= 30 && !pos.hitBreakevenTrigger) {
-                         pos.hitBreakevenTrigger = true;
-                     }
+        // Global Stop Loss (approx -40%)
+        // If current odds < 0.6 * entry?
+        if (marketOdds < pos.entryPrice * 0.6) { shouldExit = true; reason = "STOP -40%"; }
+        
+        // Expiry?
+        if (timeLeftMin <= 0) {
+             shouldExit = true; reason = "EXPIRY";
+             const win = pos.side === "UP" ? (price >= row.price_to_beat) : (price < row.price_to_beat);
+             // If win, odds = 1. If loss, odds = 0.
+             const finalOdds = win ? 1.0 : 0.0;
+             // Re-calc pnl based on final
+             const finalValue = finalOdds * pos.shares;
+             const finalPnl = finalValue - pos.amount;
+             
+             paperState.balance += finalValue;
+             paperState.trades.push({
+                type: "EXIT",
+                strategy: pos.strategy,
+                side: pos.side,
+                entry: pos.entryPrice.toFixed(2),
+                exit: finalOdds.toFixed(2),
+                pnl: finalPnl,
+                reason
+            });
+            positions.splice(i, 1);
+            continue;
+        }
 
-                     // STOP LOSS (-20%)
-                     if (roiPct <= -CONFIG.stopLossRoiPct && secondsSinceEntry >= CONFIG.stopLossGracePeriodSeconds) {
-                         if (pos.hitBreakevenTrigger && roiPct < 0) {
-                             closePosition(pos, pos.entryPrice, `STOP_LOSS_BREAKEVEN (Locked)`, ts, row);
-                             positions = positions.filter(p => p !== pos);
-                             continue;
-                         }
-                         closePosition(pos, normPrice, `STOP_LOSS (${roiPct.toFixed(1)}%)`, ts, row);
-                         positions = positions.filter(p => p !== pos);
-                         continue;
-                     }
- 
-                     // BREAKEVEN PROTECTION
-                     if (pos.hitBreakevenTrigger && roiPct <= 0) {
-                         closePosition(pos, pos.entryPrice, `STOP_LOSS_BREAKEVEN (Protection)`, ts, row);
-                         positions = positions.filter(p => p !== pos);
-                         continue;
-                     }
-                     
-                     // HALF-TIME RULE
-                     if (timeLeft !== null && timeLeft <= 7.5 && roiPct < 0) {
-                         closePosition(pos, normPrice, `HALF_TIME_EXIT (${roiPct.toFixed(1)}%)`, ts, row);
-                         positions = positions.filter(p => p !== pos);
-                         continue;
-                     }
- 
-                     // TAKE PROFIT
-                     if (normPrice >= CONFIG.takeProfitPrice || roiPct >= CONFIG.takeProfitRoiPct) {
-                         closePosition(pos, normPrice, `TAKE_PROFIT_EARLY (${roiPct.toFixed(1)}%)`, ts, row);
-                         positions = positions.filter(p => p !== pos);
-                         continue;
-                     }
-                 }
+        if (shouldExit) {
+            // Close
+            const exitValue = marketOdds * pos.shares;
+            const pnl = exitValue - pos.amount;
+            paperState.balance += exitValue;
+            paperState.trades.push({
+                type: "EXIT",
+                strategy: pos.strategy,
+                side: pos.side,
+                entry: pos.entryPrice.toFixed(2),
+                exit: marketOdds.toFixed(2),
+                pnl: pnl,
+                reason
+            });
+            positions.splice(i, 1);
+        }
+    }
+
+    // 2. Check Entries
+    if (rec.action === "ENTER") {
+        if (positions.length < 2) {
+             const odds = rec.side === "UP" ? row.mkt_up : row.mkt_down;
+             
+             // Price Guard (0.40 - 0.60)
+             if (odds < 0.40 || odds > 0.60) {
+                 // console.log("Skipping entry due to price filter:", odds);
+                 return; 
+             }
+
+             // Basic amount $5
+             const amount = 5;
+             if (odds && paperState.balance >= amount) {
+                 paperState.balance -= amount;
+                 positions.push({
+                     side: rec.side,
+                     strategy: rec.strategy,
+                     entryPrice: odds,
+                     amount: amount,
+                     shares: amount / odds
+                 });
              }
         }
-
-        // 3. CHECK ENTRY (Balanced Stacking - Power of 2)
-        const maxPos = CONFIG.maxConcurrentPositions || 2;
-        if (positions.length < maxPos) {
-            // Entry Debounce (Micro-debounce) - After PLACING an order
-            const msSinceEntry = ts - lastEntryTime;
-            const debounceMs = (CONFIG.entryCooldownSeconds || 15) * 1000;
-            if (msSinceEntry < debounceMs) continue;
-
-            const parts = (row.recommendation || "").split(":");
-            if (parts.length >= 2) {
-                const side = parts[0]; 
-                
-                // EMA MOMENTUM FILTER
-                const ema5 = computeEma(priceHistory, 200); 
-                let emaTrend = "NEUTRAL";
-                if (ema5) emaTrend = spot > ema5 ? "UP" : "DOWN";
-
-                const trendCheck = (side === "UP" && emaTrend === "UP") || (side === "DOWN" && emaTrend === "DOWN");
-
-                if (trendCheck) {
-                    const price = side === "UP" ? row.mkt_up : row.mkt_down;
-                    if (price !== null) {
-                        const normPrice = price > 1.05 ? price / 100 : price;
-                        
-                        if (normPrice >= CONFIG.minEntryPrice && normPrice <= CONFIG.maxEntryPrice) {
-                            // ENTER (Unrestricted for backtest)
-                            positions.push({
-                                side,
-                                entryPrice: normPrice,
-                                shares: 10 / normPrice,
-                                amount: 10 * (1 + CONFIG.feePct/100),
-                                entryTime: ts,
-                                marketStrike: row.price_to_beat,
-                                hitBreakevenTrigger: false
-                            });
-                            lastEntryTime = ts;
-                        }
-                    }
-                }
-            }
-        }
     }
-
-    // Helper to close
-    function closePosition(pos, exitPrice, reason, time, row) {
-        const proceeds = pos.shares * exitPrice;
-        let pnl = proceeds - pos.amount;
-        
-        // Fee on Exit? (Only if not Expiry)
-        if (reason !== "EXPIRY_SETTLEMENT") {
-             const fee = proceeds * (CONFIG.feePct / 100);
-             pnl -= fee;
-        }
-
-        balance += pnl;
-        
-        const isWin = pnl > 0;
-        if (isWin) consecutiveLosses = 0;
-        else consecutiveLosses++;
-        
-        trades.push({
-            entryTime: new Date(pos.entryTime).toISOString(),
-            exitTime: new Date(time).toISOString(),
-            side: pos.side,
-            entryPrice: pos.entryPrice,
-            exitPrice: exitPrice,
-            pnl: pnl,
-            reason: reason,
-            strike: pos.marketStrike,
-            spotAtExit: row.current_price
-        });
-        
-        // console.log(`[${new Date(time).toISOString()}] CLOSE ${pos.side} @ ${exitPrice.toFixed(2)} (${reason}) PnL: ${pnl.toFixed(2)} Bal: ${balance.toFixed(2)}`);
-        
-        // Reverted Penalty Box (Phase 7): Set lastExitTime normally
-        lastExitTime = time;
-    }
-
-    // Report
-    console.log("\n--- BACKTEST RESULTS (IMPROVED STRATEGY) ---");
-    console.log(`Config: Min/MaxEntry=[${CONFIG.minEntryPrice}-${CONFIG.maxEntryPrice}], SL=${CONFIG.stopLossRoiPct}%`);
-    console.log("----------------------------------------------------------------");
-    console.log("Entry Time           | Side | Entry | Exit  | PnL     | Reason");
-    console.log("----------------------------------------------------------------");
-    trades.forEach(t => {
-        console.log(`${t.entryTime.slice(11, 19)} | ${t.side.padEnd(4)} | ${t.entryPrice.toFixed(2)}  | ${t.exitPrice.toFixed(2)}  | ${t.pnl > 0 ? "+" : ""}${t.pnl.toFixed(2).padEnd(6)} | ${t.reason}`);
-    });
-    console.log("----------------------------------------------------------------");
-    
-    const wins = trades.filter(t => t.pnl > 0).length;
-    const losses = trades.length - wins;
-    const winRate = trades.length > 0 ? (wins / trades.length) * 100 : 0;
-    
-    console.log(`Total Trades: ${trades.length}`);
-    console.log(`Wins: ${wins} (${winRate.toFixed(1)}%)`);
-    console.log(`Losses: ${losses}`);
-    console.log(`Final Balance: $${balance.toFixed(2)} (Start: $1000)`);
-    console.log(`Net PnL: $${(balance - 1000).toFixed(2)}`);
 }
 
 runBacktest();
