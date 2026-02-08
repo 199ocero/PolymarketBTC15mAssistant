@@ -162,7 +162,7 @@ export function getWinStats() {
         console.error("Error fetching win stats:", err);
         resolve({ totalAll: 0, winsAll: 0, totalToday: 0, winsToday: 0 }); // Fail safe
       } else {
-        console.log(`[DB Debug] WinStats: ${JSON.stringify(row)} (todayStart: ${todayStart})`);
+        // console.log(`[DB Debug] WinStats: ${JSON.stringify(row)} (todayStart: ${todayStart})`);
         resolve({
           totalAll: row?.total_all || 0,
           winsAll: row?.wins_all || 0,

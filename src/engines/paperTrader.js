@@ -11,6 +11,12 @@ export class PaperTrader {
   constructor(logger = null) {
     this.state = this.loadState();
     this.logger = logger;
+    
+    if (this.state.isNew) {
+      delete this.state.isNew;
+      this.saveState();
+      this.log("[Paper] Initialized new state file.");
+    }
   }
 
   log(msg) {
@@ -43,7 +49,7 @@ export class PaperTrader {
       console.error("Failed to load paper state:", err);
     }
 
-    return defaultState;
+    return { ...defaultState, isNew: true };
   }
 
   saveState() {
@@ -81,7 +87,7 @@ export class PaperTrader {
   }
 
   // Called every tick
-  async update({ signal, rec, prices, market, tokens, trend }) {
+  async update({ signal, rec, prices, market, tokens, trend, timeLeftMin }) {
     if (!market || !rec) return;
 
     // 0. Reset Daily Loss if new day
@@ -90,13 +96,14 @@ export class PaperTrader {
     await this.checkResolution(market, prices, { 
       isExpired: rec.isExpired || false, 
       strikePrice: rec.strikePrice || null, 
-      spotPrice: rec.spotPrice || null 
+      spotPrice: rec.spotPrice || null,
+      timeLeftMin
     });
 
     // 2. Check Take Profit
     // We can do this before or after Entry. Usually good to check managing current pos first.
     // 2. Check Exits (TP / SL)
-    await this.checkExitConditions(market, prices, { timeLeftMin: rec.timeLeftMin });
+    await this.checkExitConditions(market, prices, { timeLeftMin: rec.timeLeftMin, trend });
 
     // 3. Execute Signals
     const marketSlug = market.slug;
@@ -120,7 +127,7 @@ export class PaperTrader {
     }
   }
 
-  async checkExitConditions(market, prices, { timeLeftMin } = {}) {
+  async checkExitConditions(market, prices, { timeLeftMin, trend } = {}) {
     if (!this.state.positions || this.state.positions.length === 0) return;
 
     // Use a copy to iterate because we might remove items
@@ -128,9 +135,8 @@ export class PaperTrader {
     
     for (const pos of activePositions) {
         if (pos.marketSlug !== market.slug) continue;
-
         const { side, entryPrice, entryTime } = pos;
-        const price = side === "UP" ? prices.up : prices.down;
+        const price = (side === "UP" ? prices?.up : prices?.down) ?? null;
         
         if (price === null || price === undefined) continue;
 
@@ -139,6 +145,9 @@ export class PaperTrader {
         const roiPct = roi * 100;
 
         const breakevenRoi = CONFIG.paper.breakevenTriggerRoiPct || 30;
+        
+        const entryAgeSeconds = (Date.now() - entryTime) / 1000;
+        const gracePeriod = CONFIG.paper.stopLossGracePeriodSeconds || 15;
 
         // 0. BREAKEVEN TRIGGER
         // 0. TIME STOP (Global vs Strategy Specific)
@@ -148,8 +157,27 @@ export class PaperTrader {
         const timeGuard = isLateWindow ? 0.5 : (CONFIG.paper.timeGuardMinutes || 2); 
         
         if (timeLeftMin !== undefined && timeLeftMin <= timeGuard) {
-             await this.closePosition(pos, price, `TIME_GUARD_EXIT (<${timeGuard}m)`);
-             continue;
+             const resThreshold = CONFIG.paper.resolutionThreshold || 0.95;
+             
+             // SKIP EXIT IF:
+             // 1. Position is "favored" (Price > 0.50)
+             const isFavored = normPrice > 0.50;
+             // 2. Position is "Hopeful" (Price > 0.20 AND Trend matches side)
+             const isHopeful = normPrice > 0.20 && trend === (side === "UP" ? "RISING" : "FALLING");
+             // 3. Position is near resolution loss (Price < 0.05, save fees)
+             const isNearLoss = normPrice <= (1 - resThreshold);
+
+             if (isFavored || isHopeful || isNearLoss) {
+                let reason = "UNSET";
+                if (isFavored) reason = "FAVORED (>50¢)";
+                else if (isHopeful) reason = "HOPEFUL (Trend Matching)";
+                else if (isNearLoss) reason = "NEAR_LOSS (<5¢)";
+                
+                this.log(`[Paper] Skipping TIME_GUARD_EXIT for ${side}: ${reason} at ${normPrice.toFixed(2)} [Trend: ${trend}] in last ${(timeLeftMin*60).toFixed(0)}s`);
+             } else {
+                await this.closePosition(pos, price, `TIME_GUARD_EXIT (<${timeGuard}m)`);
+                continue;
+             }
         }
 
         // 1. HARD STOP LOSS (Global -40% or Strategy specific?)
@@ -165,11 +193,9 @@ export class PaperTrader {
 
         // 2. STRATEGY SPECIFIC TAKE PROFIT
         if (pos.strategy === "MOMENTUM") {
-            // Target: Odds move 15-20 cents (0.15 - 0.20)
-            // profit = normPrice - entryPrice
-            const profit = normPrice - entryPrice;
-            if (profit >= 0.15) {
-                await this.closePosition(pos, price, `TP_MOMENTUM (+${(profit*100).toFixed(0)}¢)`);
+            // Target: ROI Based (User Configured, default 50%)
+            if (roiPct >= (CONFIG.paper.momentumTakeProfitRoiPct || 50)) {
+                await this.closePosition(pos, price, `TP_MOMENTUM (+${roiPct.toFixed(1)}%)`);
                 continue;
             }
         } else if (pos.strategy === "MEAN_REVERSION") {
@@ -201,19 +227,26 @@ export class PaperTrader {
     }
   }
 
-  async checkResolution(market, prices, { isExpired, strikePrice, spotPrice } = {}) {
+  async checkResolution(market, prices, { isExpired, strikePrice, spotPrice, timeLeftMin } = {}) {
     if (!this.state.positions || this.state.positions.length === 0) return;
 
-    if (isExpired && strikePrice !== null && spotPrice !== null) {
-      const activePositions = [...this.state.positions];
-      for (const pos of activePositions) {
-        if (pos.marketSlug !== market.slug) continue;
+    const activePositions = [...this.state.positions];
+    for (const pos of activePositions) {
+      // 1. Check for expiration based on stored endDate or passed timeLeftMin
+      const posExpired = (timeLeftMin !== undefined && timeLeftMin <= 0) || 
+                         (pos.endDate && Date.now() >= pos.endDate);
+      
+      const posStrike = pos.strikePrice || strikePrice;
+      const posSpot = spotPrice; // Current market spot price
+
+      if (posExpired && posStrike !== null && posSpot !== null) {
         const side = pos.side;
         let win = false;
-        if (side === "UP") win = spotPrice >= strikePrice;
-        else if (side === "DOWN") win = spotPrice < strikePrice;
+        if (side === "UP") win = posSpot >= posStrike;
+        else if (side === "DOWN") win = posSpot < posStrike;
         
-        await this.closePosition(pos, win ? 1 : 0, `EXPIRY (Spot: ${spotPrice}, Strike: ${strikePrice})`);
+        // Use 1 or 0 for exit price to implement the $1.00 implementation properly
+        await this.closePosition(pos, win ? 1 : 0, `EXPIRY (Spot: ${posSpot}, Strike: ${posStrike})`);
       }
     }
   }
@@ -287,7 +320,7 @@ export class PaperTrader {
     this.log(`[Paper] Closed ${side} at ${exitPrice} (${reason}). PnL: $${pnl.toFixed(2)} (Fee: $${fee.toFixed(2)}) DailyNetLoss: $${this.state.dailyLoss.toFixed(2)}`);
   }
 
-  async handleEntrySignal(rec, side, strength, marketSlug, priceUp, priceDown, trend) {
+  async handleEntrySignal(rec, side, confidence, marketSlug, priceUp, priceDown, trend) {
     const currentPos = this.state.position;
     
     // Price safety
@@ -320,12 +353,13 @@ export class PaperTrader {
     
     // Log Probability for debugging
     if (rec) {
-       this.log(`[Probability] Strategy: ${rec.strategy} Market: ${normalizedPrice.toFixed(2)} Strength: ${strength}`);
+       this.log(`[Probability] Strategy: ${rec.strategy} Market: ${normalizedPrice.toFixed(2)} Confidence: ${rec.confidence}`);
     }
 
     // 1. Daily Loss Limit
-    // User said: "below -15". So if dailyLoss > 15, we stop.
-    if ((this.state.dailyLoss || 0) >= CONFIG.paper.dailyLossLimit) {
+    // Percentage-based: 30% of current balance
+    const dailyLossLimit = this.state.balance * (CONFIG.paper.dailyLossLimitPct / 100);
+    if ((this.state.dailyLoss || 0) >= dailyLossLimit) {
         // Only log once per minute to avoid spam? Or just return silent?
         // console.log("[Paper] Daily Loss Limit Hit. No new trades.");
         return;
@@ -357,17 +391,33 @@ export class PaperTrader {
     // Strategy logic already enforced trend.
     // If we have a signal, we trust the strategy.
     
-    // 4. Position Sizing (Fixed $3-5 based on conviction)
+    // 4. Position Sizing (Kelly Criterion or Fixed $3-5 based on conviction)
     
-    // User Plan:
-    // Very High Conviction (Late Window): $5
-    // High Conviction (Momentum): $4
-    // Medium Conviction (Mean Reversion): $3
-    
-    if (rec.strategy === "LATE_WINDOW") tradeAmount = 5;
-    else if (rec.strategy === "MOMENTUM") tradeAmount = 4;
-    else if (rec.strategy === "MEAN_REVERSION") tradeAmount = 3;
-    else tradeAmount = CONFIG.paper.minBet; // Fallback
+    if (CONFIG.paper.useKelly && rec.probability !== undefined) {
+        const p = rec.probability;
+        const b = this.state.balance;
+        const price = normalizedPrice;
+        const f = CONFIG.paper.kellyFraction || 0.5;
+        
+        // Kelly Formula for Binary Options: (p * (b + 1) - 1) / b 
+        // where b is the odds (payout per $1 bet). 
+        // On Polymarket, if you buy at $0.60, you win $1.00 ($0.40 profit).
+        // b = profit / cost = (1 - price) / price
+        // Simplified Kelly: (p - price) / (1 - price)
+        
+        const kelly = (p - price) / (1 - price);
+        const kellyAmount = b * f * kelly;
+        
+        tradeAmount = Math.max(CONFIG.paper.minKellyBet, Math.min(CONFIG.paper.maxKellyBet, kellyAmount));
+        
+        this.log(`[Kelly] Prob: ${p.toFixed(2)} Price: ${price.toFixed(2)} Kelly: ${kelly.toFixed(2)} -> $${tradeAmount.toFixed(2)}`);
+    } else {
+        // Fixed Sizing (Legacy)
+        if (rec.strategy === "LATE_WINDOW") tradeAmount = 5;
+        else if (rec.strategy === "MOMENTUM") tradeAmount = 4;
+        else if (rec.strategy === "MEAN_REVERSION") tradeAmount = 3;
+        else tradeAmount = CONFIG.paper.minBet; // Fallback
+    }
 
      // FLIP FLOP LOGIC (Reversal)
      const marketPositions = this.state.positions.filter(p => p.marketSlug === marketSlug);
@@ -396,7 +446,9 @@ export class PaperTrader {
           shares,
           entryTime: Date.now(),
           hitBreakevenTrigger: false,
-          strategy: rec.strategy || "UNKNOWN"
+          strategy: rec.strategy || "UNKNOWN",
+          strikePrice: rec.strikePrice || null,
+          endDate: rec.endDate || null
         });
         
         this.state.lastEntryTime = Date.now(); // Track entry for debounce
@@ -423,8 +475,9 @@ export class PaperTrader {
   }
   getBlockingReason(side, trend) {
     // 1. Daily Loss Limit
-    if ((this.state.dailyLoss || 0) >= CONFIG.paper.dailyLossLimit) {
-      return "Daily Loss Limit";
+    const dailyLossLimit = this.state.balance * (CONFIG.paper.dailyLossLimitPct / 100);
+    if ((this.state.dailyLoss || 0) >= dailyLossLimit) {
+      return "Daily Loss Limit (%)";
     }
 
     // 2. Penalty Box / Cooldown Logic: Reverted in Phase 7 to prioritize recovery trades.

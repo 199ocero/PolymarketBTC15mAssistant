@@ -113,7 +113,6 @@ function sepLine(ch = "─") {
 }
 
 function renderScreen(text) {
-  /*
   try {
     readline.cursorTo(process.stdout, 0, 0);
     readline.clearScreenDown(process.stdout);
@@ -121,7 +120,6 @@ function renderScreen(text) {
     // ignore
   }
   process.stdout.write(text);
-  */
 }
 
 function stripAnsi(s) {
@@ -490,9 +488,13 @@ async function fetchPolymarketSnapshot() {
 }
 
 async function main() {
-  const binanceStream = startBinanceTradeStream({ symbol: CONFIG.symbol });
-  const polymarketLiveStream = startPolymarketChainlinkPriceStream({});
-  const chainlinkStream = startChainlinkPriceStream({});
+  if (!global.binanceStream) global.binanceStream = startBinanceTradeStream({ symbol: CONFIG.symbol });
+  if (!global.polymarketLiveStream) global.polymarketLiveStream = startPolymarketChainlinkPriceStream({});
+  if (!global.chainlinkStream) global.chainlinkStream = startChainlinkPriceStream({});
+
+  const binanceStream = global.binanceStream;
+  const polymarketLiveStream = global.polymarketLiveStream;
+  const chainlinkStream = global.chainlinkStream;
 
   let prevSpotPrice = null;
   let prevCurrentPrice = null;
@@ -521,19 +523,40 @@ async function main() {
   let lastStrikeCheckTime = 0;
   let consecutiveErrors = 0;
 
-  /*
   if (process.stdout.isTTY) {
+    process.stdout.write("\x1b[?25l"); // Hide cursor
     console.clear();
   }
-  */
 
   pushActivity(`System: PolyBot Dashboard Live at http://localhost:${PORT}`);
 
-  while (true) {
-    const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
+  // Main Loop State
+  let tickCount = 0;
+  
+  // Safe Performance Optimization: 250ms ticks
+  const LOOP_INTERVAL_MS = 250;
+  const SLOW_TICKS = 8; // 8 * 250ms = 2s
 
+  // Initialize cached analysis to avoid empty UI on first tick
+  if (!global.lastAnalysis) global.lastAnalysis = {};
+
+  while (true) {
+    try {
+      const timing = getCandleWindowTiming(CONFIG.candleWindowMinutes);
+
+    // 1. Fetch Fast Data (Every Tick)
     const wsTick = binanceStream.getLast();
-    const wsPrice = wsTick?.price ?? null;
+    let spotPrice = wsTick?.price ?? prevSpotPrice;
+
+    // Fetch Binance REST if WS is missing (Throttled fallback)
+    if (spotPrice === null && tickCount % (SLOW_TICKS * 5) === 0) { // Every ~10s
+        try {
+            const res = await fetchLastPrice();
+            if (res) spotPrice = res;
+        } catch (err) {
+            // ignore
+        }
+    }
 
     const polymarketWsTick = polymarketLiveStream.getLast();
     const polymarketWsPrice = polymarketWsTick?.price ?? null;
@@ -541,25 +564,45 @@ async function main() {
     const chainlinkWsTick = chainlinkStream.getLast();
     const chainlinkWsPrice = chainlinkWsTick?.price ?? null;
 
-    try {
-      const chainlinkPromise = polymarketWsPrice !== null
-        ? Promise.resolve({ price: polymarketWsPrice, updatedAt: polymarketWsTick?.updatedAt ?? null, source: "polymarket_ws" })
-        : chainlinkWsPrice !== null
-          ? Promise.resolve({ price: chainlinkWsPrice, updatedAt: chainlinkWsTick?.updatedAt ?? null, source: "chainlink_ws" })
-          : fetchChainlinkBtcUsd();
+    // Fetch Chainlink if WS is missing (Throttled fallback)
+    let chainlinkPrice = chainlinkWsPrice ?? polymarketWsPrice;
+    if (chainlinkPrice === null && tickCount % (SLOW_TICKS * 5) === 0) { // Every ~10s
+        const res = await fetchChainlinkBtcUsd();
+        if (res) chainlinkPrice = res.price;
+    }
+    const currentPrice = chainlinkPrice ?? prevCurrentPrice;
 
-      const [klines1m, klines5m, lastPrice, chainlink, poly] = await Promise.all([
-        fetchKlines({ interval: "1m", limit: 240 }),
-        fetchKlines({ interval: "5m", limit: 200 }),
-        fetchLastPrice(),
-        chainlinkPromise,
-        fetchPolymarketSnapshot()
-      ]);
+    // --- SLOW DATA (Throttled) ---
+    const isSlowTick = (tickCount % SLOW_TICKS === 0) || (tickCount === 0);
+    
+    // Fetch Poly Snapshot (Throttled)
+    let poly = global.lastPolyResult;
+    if (isSlowTick) {
+         poly = await fetchPolymarketSnapshot();
+         global.lastPolyResult = poly;
+    }
+    if (!poly) poly = { ok: false, prices: { up: null, down: null } };
 
-      // 0. CHECK FOR MANUAL STRIKE OVERRIDE (Poll every 5s)
-      const strikeFile = "strike.txt";
-      if (Date.now() - lastStrikeCheckTime > 5000) {
-        lastStrikeCheckTime = Date.now();
+    // Fetch Candles (Throttled)
+    let klines1m = [];
+    let fetchedLastPrice = null;
+    
+    if (isSlowTick) {
+        klines1m = await fetchKlines({ interval: "1m", limit: 240 });
+        fetchedLastPrice = await fetchLastPrice();
+    }
+    
+    const lastPrice = fetchedLastPrice || prevSpotPrice;
+
+    // State persistence
+    prevSpotPrice = spotPrice ?? prevSpotPrice;
+    prevCurrentPrice = currentPrice ?? prevCurrentPrice;
+
+    // --- CRITICAL: Strategy Logic (Throttled) ---
+      
+    // 0. CHECK FOR MANUAL STRIKE OVERRIDE (Poll every 5s - approx 20 ticks)
+    if (tickCount % 20 === 0) {
+        const strikeFile = "strike.txt";
         if (fs.existsSync(strikeFile)) {
           try {
             const content = fs.readFileSync(strikeFile, "utf8").trim();
@@ -575,545 +618,393 @@ async function main() {
         }
       }
 
-
-
-      const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
-      const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
-
-      const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
-
-      const candles = klines1m;
-      const closes = candles.map((c) => c.close);
-
-      const vwap = computeSessionVwap(candles);
-      const vwapSeries = computeVwapSeries(candles);
-      const vwapNow = vwapSeries[vwapSeries.length - 1];
-
-      const lookback = CONFIG.vwapSlopeLookbackMinutes;
-      const vwapSlope = vwapSeries.length >= lookback ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback : null;
-      const vwapDist = vwapNow ? (lastPrice - vwapNow) / vwapNow : null;
-
-      const rsiNow = computeRsi(closes, CONFIG.rsiPeriod);
-      const rsiSeries = [];
-      for (let i = 0; i < closes.length; i += 1) {
-        const sub = closes.slice(0, i + 1);
-        const r = computeRsi(sub, CONFIG.rsiPeriod);
-        if (r !== null) rsiSeries.push(r);
-      }
-      const rsiMa = sma(rsiSeries, CONFIG.rsiMaPeriod);
-      const rsiSlope = slopeLast(rsiSeries, 3);
-
-      const macd = computeMacd(closes, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
-
-      const ha = computeHeikenAshi(candles);
-      const consec = countConsecutive(ha);
-
-      const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
-      
-      // New: Calculate Gap
-      const spotPrice = wsPrice ?? lastPrice;
-      const gap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
-
-      // Calculate EMAs for Scalp Strategy
-      const ema200 = computeEma(closes, 200); 
-      const ema21 = computeEma(closes, 21);
-      const ema9 = computeEma(closes, 9);
-      const lastPriceForEma = spotPrice ?? lastPrice;
-      const emaTrend = ema21 !== null ? (lastPriceForEma > ema21 ? "RISING" : "FALLING") : "NEUTRAL";
-
-      const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
-      const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
-
-      const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
-        ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
-        : false;
-
-      const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
-      const lastClose = lastCandle?.close ?? null;
-      const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
-      const close3mAgo = klines1m.length >= 4 ? klines1m[klines1m.length - 4]?.close ?? null : null;
-      const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
-      const delta3m = lastClose !== null && close3mAgo !== null ? lastClose - close3mAgo : null;
-
-
-      const currentPrice = chainlink?.price ?? null;
-      const marketSlug = poly.ok ? String(poly.market?.slug ?? "") : "";
-      const marketStartMs = poly.ok && poly.market?.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
-
-      if (marketSlug && priceToBeatState.slug !== marketSlug) {
-        priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
-      }
-
-      if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
-          // 1. Try to recover from metadata (Fix for Restarts)
-          const metaStrike = priceToBeatFromPolymarketMarket(poly.market);
+      // Logic for Strike Price Latching (Needs Poly Market Data)
+      if (poly.ok && poly.market) {
+          const marketSlug = String(poly.market.slug ?? "");
+          const marketStartMs = poly.market.eventStartTime ? new Date(poly.market.eventStartTime).getTime() : null;
           
-          if (metaStrike !== null && Number.isFinite(metaStrike)) {
-             priceToBeatState = { 
-                slug: priceToBeatState.slug, 
-                value: metaStrike, 
-                setAtMs: Date.now() 
-             };
-             // console.log(`[Strike] Recovered strike from metadata: ${metaStrike}`);
-          } 
-          // 2. Fallback to Latching (Only if metadata failed AND we are live)
-          else {
-             const nowMs = Date.now();
-             const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
-             if (okToLatch) {
-                priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
-             }
+          if (marketSlug && priceToBeatState.slug !== marketSlug) {
+            priceToBeatState = { slug: marketSlug, value: null, setAtMs: null };
+          }
+          if (priceToBeatState.slug && priceToBeatState.value === null && currentPrice !== null) {
+              const metaStrike = priceToBeatFromPolymarketMarket(poly.market);
+              if (metaStrike !== null && Number.isFinite(metaStrike)) {
+                 priceToBeatState = { slug: priceToBeatState.slug, value: metaStrike, setAtMs: Date.now() };
+              } else {
+                 const nowMs = Date.now();
+                 const okToLatch = marketStartMs === null ? true : nowMs >= marketStartMs;
+                 if (okToLatch) {
+                    priceToBeatState = { slug: priceToBeatState.slug, value: Number(currentPrice), setAtMs: nowMs };
+                 }
+              }
           }
       }
+      const priceToBeat = priceToBeatState.value;
 
-      const priceToBeat = priceToBeatState.slug === marketSlug ? priceToBeatState.value : null;
-
-      const regimeInfo = detectRegime({
-        price: lastPrice,
-        vwap: vwapNow,
-        vwapSlope,
-        vwapCrossCount,
-        volumeRecent,
-        volumeAvg
-      });
-
-      const scored = scoreDirection({
-        price: lastPrice,
-        vwap: vwapNow,
-        vwapSlope,
-        vwapCrossCount: null, // Not used inside scoreDirection but good to keep signature clean if needed later
-        volumeRecent: null,
-        volumeAvg: null,
-        rsi: rsiNow,
-        rsiSlope,
-        macd,
-        heikenColor: consec.color,
-        heikenCount: consec.count,
-        failedVwapReclaim,
-        delta: delta1m,
-        gap, // Add gap input
-        priceToBeat // Add priceToBeat
-      });
-
-
-
-      // Time awareness removed to allow trades at any time based on TA signal
-      const timeAware = { timeDecay: 1, adjustedUp: scored.rawUp, adjustedDown: 1 - scored.rawUp };
-
-      const marketUp = poly.ok ? poly.prices.up : null;
-      const marketDown = poly.ok ? poly.prices.down : null;
+      // --- GAP CALCULATION (Redefined) ---
+      // 1. binanceGap = Binance WS - Binance REST (Old "gap", mostly for magnet/internal logic)
+      const binanceGap = (spotPrice !== null && lastPrice !== null) ? spotPrice - lastPrice : null;
       
-      // New Scalp Decide Call
-      const rec = decide({
-        trend: emaTrend, // uses EMA21 now
-        timeLeftMin,
-        spotPrice: currentPrice, // Use Chainlink/Live price
-        strikePrice: priceToBeat,
-        marketOdds: { up: marketUp, down: marketDown },
-        indicators: {
-            ema21,
-            ema9,
+      // 2. uiGap = Chainlink - Strike (New "Gap" for user)
+      const uiGap = (currentPrice !== null && priceToBeat !== null) ? currentPrice - priceToBeat : null;
+
+      // Fetch Recent Trades (Throttled)
+      let recentTrades = global.lastAnalysis?.recentTrades || [];
+      let winStats = global.lastAnalysis?.winStats || { winsToday: 0, totalToday: 0, winsAll: 0, totalAll: 0 };
+      
+      // Fire-and-forget update to prevent main loop blocking
+      if (isSlowTick) {
+          getWinStats().then(stats => {
+             winStats = stats;
+             if (global.lastAnalysis) global.lastAnalysis.winStats = stats;
+          }).catch(err => {
+             // ignore
+          });
+      }
+
+      if (isSlowTick) {
+          getRecentTrades(5).then(trades => {
+              recentTrades = trades;
+              if (global.lastAnalysis) global.lastAnalysis.recentTrades = trades;
+          }).catch(err => {
+              // ignore
+          });
+      }
+
+      // If Slow Tick, Run Strategy
+      if (isSlowTick && klines1m.length > 0) {
+          // Reconstruct variables needed for strategy
+          const candles = klines1m;
+          const closes = candles.map((c) => c.close);
+          const vwap = computeSessionVwap(candles);
+          const vwapSeries = computeVwapSeries(candles);
+          const vwapNow = vwapSeries[vwapSeries.length - 1];
+          const lookback = CONFIG.vwapSlopeLookbackMinutes;
+          const vwapSlope = vwapSeries.length >= lookback ? (vwapNow - vwapSeries[vwapSeries.length - lookback]) / lookback : null;
+          const vwapCrossCount = countVwapCrosses(closes, vwapSeries, 20);
+          
+          const rsiNow = computeRsi(closes, CONFIG.rsiPeriod);
+          const rsiSeries = [];
+          for (let i = 0; i < closes.length; i += 1) {
+            const sub = closes.slice(0, i + 1);
+            const r = computeRsi(sub, CONFIG.rsiPeriod);
+            if (r !== null) rsiSeries.push(r);
+          }
+          const rsiSlope = slopeLast(rsiSeries, 3);
+          const macd = computeMacd(closes, CONFIG.macdFast, CONFIG.macdSlow, CONFIG.macdSignal);
+          const ha = computeHeikenAshi(candles);
+          const consec = countConsecutive(ha); // { color, count }
+          
+          const ema21 = computeEma(closes, 21);
+          const ema9 = computeEma(closes, 9);
+          const lastPriceForEma = spotPrice ?? lastPrice;
+          const emaTrend = ema21 !== null ? (lastPriceForEma > ema21 ? "RISING" : "FALLING") : "NEUTRAL";
+          
+          const volumeRecent = candles.slice(-20).reduce((a, c) => a + c.volume, 0);
+          const volumeAvg = candles.slice(-120).reduce((a, c) => a + c.volume, 0) / 6;
+          
+          const failedVwapReclaim = vwapNow !== null && vwapSeries.length >= 3
+            ? closes[closes.length - 1] < vwapNow && closes[closes.length - 2] > vwapSeries[vwapSeries.length - 2]
+            : false;
+
+          const lastCandle = klines1m.length ? klines1m[klines1m.length - 1] : null;
+          const lastClose = lastCandle?.close ?? null;
+          const close1mAgo = klines1m.length >= 2 ? klines1m[klines1m.length - 2]?.close ?? null : null;
+          const delta1m = lastClose !== null && close1mAgo !== null ? lastClose - close1mAgo : null;
+
+          const regimeInfo = detectRegime({
+            price: lastPrice,
+            vwap: vwapNow,
+            vwapSlope,
+            vwapCrossCount,
+            volumeRecent,
+            volumeAvg
+          });
+
+          const scored = scoreDirection({
+            price: lastPrice,
+            vwap: vwapNow,
+            vwapSlope,
+            vwapCrossCount: null,
+            volumeRecent: null,
+            volumeAvg: null,
             rsi: rsiNow,
+            rsiSlope,
             macd,
-            heikinAshi: consec, // { color, count }
-            vwap: vwapNow
-        }
-      });
-      rec.isExpired = (timeLeftMin !== null && timeLeftMin <= 0);
-      rec.strikePrice = priceToBeat;
-      rec.spotPrice = currentPrice;
-      // Pass Probability for Kelly Criterion
-      rec.probability = rec.side === "UP" ? timeAware.adjustedUp : timeAware.adjustedDown;
-      if (!Number.isFinite(rec.probability)) rec.probability = 0.5; // Fallback
+            heikenColor: consec.color,
+            heikenCount: consec.count,
+            failedVwapReclaim,
+            delta: delta1m,
+            gap: binanceGap, // Use internal Binance Gap for probability scoring
+            priceToBeat
+          });
+          
+          const timeAware = { timeDecay: 1, adjustedUp: scored.rawUp, adjustedDown: 1 - scored.rawUp };
+          const marketUp = poly.ok ? poly.prices.up : null;
+          const marketDown = poly.ok ? poly.prices.down : null;
+          
+          const settlementMs = poly.ok && poly.market?.endDate ? new Date(poly.market.endDate).getTime() : null;
+          const settlementLeftMin = settlementMs ? (settlementMs - Date.now()) / 60_000 : null;
+          const timeLeftMin = settlementLeftMin ?? timing.remainingMinutes;
 
+          // Decide Signal
+          const rec = decide({
+            trend: emaTrend,
+            timeLeftMin,
+            spotPrice: currentPrice,
+            strikePrice: priceToBeat,
+            marketOdds: { up: marketUp, down: marketDown },
+            indicators: {
+                ema21,
+                ema9,
+                rsi: rsiNow,
+                macd,
+                heikinAshi: consec,
+                vwap: vwapNow,
+                candles
+            }
+          });
 
-      // TIME GUARD Removed
-      // END GUARD Removed
+          const edge = computeEdge({
+            modelUp: timeAware.adjustedUp,
+            modelDown: timeAware.adjustedDown,
+            marketYes: marketUp,
+            marketNo: marketDown
+          });
 
-      // Update Paper Trader
-      await paper.update({
-          signal: scored,
-          rec,
-          prices: poly.ok ? poly.prices : { up: null, down: null },
-          market: poly.ok ? poly.market : null,
-          tokens: poly.ok ? poly.tokens : null,
-          trend: emaTrend, // Using EMA Trend (Momentum Filter)
-          timeLeftMin // Pass timeLeftMin for Half-Time rule
-      });
-      const paperPnL = paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null });
+          rec.isExpired = (timeLeftMin !== null && timeLeftMin <= 0);
+          rec.timeLeftMin = timeLeftMin;
+          rec.strikePrice = priceToBeat;
+          rec.spotPrice = currentPrice;
+          rec.endDate = settlementMs;
+          rec.probability = (rec.side === "UP") ? timeAware.adjustedUp : (rec.side === "DOWN" ? timeAware.adjustedDown : 0);
+          if (!Number.isFinite(rec.probability)) rec.probability = 0.5;
+          rec.edge = rec.side === "UP" ? edge.edgeUp : (rec.side === "DOWN" ? edge.edgeDown : 0);
+          if (rec.edge < 0) rec.edge = 0;
 
-      const trendLabel = (() => {
-           if (closes.length < 6) return "FLAT";
-           const cNow = closes[closes.length - 1];
-           const cPast = closes[closes.length - 6];
-           return cNow > cPast ? "RISING" : "FALLING";
-      })();
+          // Update Paper Trader
+          await paper.update({
+              signal: scored,
+              rec,
+              prices: poly.ok ? poly.prices : { up: null, down: null },
+              market: poly.ok ? poly.market : null,
+              tokens: poly.ok ? poly.tokens : null,
+              trend: emaTrend, 
+              timeLeftMin
+          });
+          
+          // Log to DB
+          // edge is already calculated above
+          logSignalToDb({
+            entry_minute: timing.elapsedMinutes,
+            time_left_min: timeLeftMin,
+            regime: regimeInfo.regime,
+            signal: rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE",
+            model_up: timeAware.adjustedUp,
+            model_down: timeAware.adjustedDown,
+            mkt_up: marketUp,
+            mkt_down: marketDown,
+            edge_up: edge.edgeUp,
+            edge_down: edge.edgeDown,
+            recommendation: rec.action === "ENTER" ? `${rec.side}:${rec.strategy}:${rec.confidence}` : "NO_TRADE",
+            price_to_beat: priceToBeat,
+            current_price: currentPrice, // Use Chainlink for record
+            binance_price: spotPrice,
+            gap: uiGap // Log the UI Gap (Chainlink - Strike)
+          }).catch(err => {
+              // Non-blocking log failure
+              if (err.message && err.message.includes("SQLITE_CANTOPEN")) {
+                  pushActivity(`${ANSI.yellow}WARN: DB Busy, log skipped.${ANSI.reset}`);
+              } else {
+                  console.error("Failed to log signal:", err.message);
+              }
+          });
+          
+          // Store heavy computation results in a persistent object for Fast Ticks to read?
+          global.lastAnalysis = {
+             timeLeftMin,
+             rec,
+             marketUp,
+             marketDown,
+             totalEquity: paper.state.balance + paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null }),
+             dailyPnl: -(paper.state.dailyLoss || 0),
+             paperBalance: paper.state.balance,
+             posPnl: paper.getUnrealizedPnL(poly.ok ? poly.prices : { up: null, down: null }),
+             position: paper.state.positions && paper.state.positions.length > 0 ? paper.state.positions[0] : null,
+             heikenValue: `${consec.color ?? "-"} x${consec.count}`,
+             haNarrative: (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL",
+             rsiValue: `${formatNumber(rsiNow, 1)}`,
+             rsiNarrative: narrativeFromSlope(rsiSlope),
+             macdLabel: macd?.hist < 0 ? "bearish" : "bullish",
+             macdNarrative: narrativeFromSign(macd?.hist),
+             vwapValue: formatNumber(vwapNow, 2),
+             vwapNarrative: narrativeFromSign((lastPrice - vwapNow) / vwapNow),
+             emaLabel: ema21 !== null ? `${formatNumber(ema21, 0)}` : "-",
+             emaTrend,
+             adviceLine: rec.action === "ENTER"
+                ? (rec.side === "UP" ? "Bullish edge detected." : "Bearish edge detected.") 
+                : (timeLeftMin !== null && timeLeftMin < 2 ? "LATE STAGE: Volatility high." : "Analyzing market momentum."),
+             recentTrades: recentTrades,
+             winStats: winStats
+          };
+      } // End Slow Tick
 
-      const vwapSlopeLabel = vwapSlope === null ? "-" : vwapSlope > 0 ? "UP" : vwapSlope < 0 ? "DOWN" : "FLAT";
+      // Calculate realtime PnL for UI (don't wait for slow tick) ...
 
-      const macdLabel = macd === null
-        ? "-"
-        : macd.hist < 0
-          ? (macd.histDelta !== null && macd.histDelta < 0 ? "bearish (expanding)" : "bearish")
-          : (macd.histDelta !== null && macd.histDelta > 0 ? "bullish (expanding)" : "bullish");
-
-
-
-      const haNarrative = (consec.color ?? "").toLowerCase() === "green" ? "LONG" : (consec.color ?? "").toLowerCase() === "red" ? "SHORT" : "NEUTRAL";
-      const rsiNarrative = narrativeFromSlope(rsiSlope);
-      const macdNarrative = narrativeFromSign(macd?.hist ?? null);
-      const vwapNarrative = narrativeFromSign(vwapDist);
-
-      const pLong = timeAware?.adjustedUp ?? null;
-      const pShort = timeAware?.adjustedDown ?? null;
-      const predictNarrative = (pLong !== null && pShort !== null && Number.isFinite(pLong) && Number.isFinite(pShort))
-        ? (pLong > pShort ? "LONG" : pShort > pLong ? "SHORT" : "NEUTRAL")
-        : "NEUTRAL";
-      const predictValue = `${ANSI.green}LONG${ANSI.reset} ${ANSI.green}${formatProbPct(pLong, 0)}${ANSI.reset} / ${ANSI.red}SHORT${ANSI.reset} ${ANSI.red}${formatProbPct(pShort, 0)}${ANSI.reset}`;
-      const predictLine = `Predict: ${predictValue}`;
-
-      const marketUpStr = `${marketUp ?? "-"}${marketUp === null || marketUp === undefined ? "" : "¢"}`;
-      const marketDownStr = `${marketDown ?? "-"}${marketDown === null || marketDown === undefined ? "" : "¢"}`;
-      const polyHeaderValue = `${ANSI.green}↑ UP${ANSI.reset} ${marketUpStr}  |  ${ANSI.red}↓ DOWN${ANSI.reset} ${marketDownStr}`;
-
-      const heikenValue = `${consec.color ?? "-"} x${consec.count}`;
-      const heikenLine = formatNarrativeValue("Heiken Ashi", heikenValue, haNarrative);
-
-      const rsiArrow = rsiSlope !== null && rsiSlope < 0 ? "↓" : rsiSlope !== null && rsiSlope > 0 ? "↑" : "-";
-      const rsiValue = `${formatNumber(rsiNow, 1)} ${rsiArrow}`;
-      const rsiLine = formatNarrativeValue("RSI", rsiValue, rsiNarrative);
-
-      const macdLine = formatNarrativeValue("MACD", macdLabel, macdNarrative);
-
-      const delta1Narrative = narrativeFromSign(delta1m);
-      const delta3Narrative = narrativeFromSign(delta3m);
-      const deltaValue = `${colorByNarrative(formatSignedDelta(delta1m, lastClose), delta1Narrative)} | ${colorByNarrative(formatSignedDelta(delta3m, lastClose), delta3Narrative)}`;
-      const deltaLine = `Delta 1/3Min: ${deltaValue}`;
-
-      const vwapValue = `${formatNumber(vwapNow, 0)} (${formatPct(vwapDist, 2)}) | slope: ${vwapSlopeLabel}`;
-      const vwapLine = formatNarrativeValue("VWAP", vwapValue, vwapNarrative);
-
-      const emaLabel = ema200 !== null ? `${formatNumber(ema200, 0)} (${emaTrend})` : "-";
-      const emaLine = formatNarrativeValue("EMA(200)", emaLabel, emaTrend === "RISING" ? "LONG" : emaTrend === "FALLING" ? "SHORT" : "NEUTRAL");
-
-      const blockingReason = rec.action === "ENTER" ? paper.getBlockingReason(rec.side, emaTrend) : null;
+      // --- BROADCAST (Every Tick 250ms) ---
+      const analysis = global.lastAnalysis || {}; // Fallback if not yet run
       
-      const signal = rec.action === "ENTER" ? (rec.side === "UP" ? "BUY UP" : "BUY DOWN") : "NO TRADE";
+      // Calculate realtime PnL for UI (don't wait for slow tick)
+      const rtPrices = poly.ok ? poly.prices : { up: null, down: null };
+      const rtPnl = paper.getUnrealizedPnL(rtPrices);
+      const rtEquity = paper.state.balance + (paper.state.position ? rtPnl : 0);
 
-      const signalColor = rec.action === "ENTER" ? (rec.side === "UP" ? ANSI.green : ANSI.red) : ANSI.gray;
-      
-      let signalLine = `${ANSI.gray}WAITING FOR EDGE...${ANSI.reset}`;
-      if (rec.action === "ENTER") {
-          if (blockingReason) {
-              signalLine = `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} ${ANSI.red}(BLOCKED: ${blockingReason})${ANSI.reset}`;
-          } else {
-              signalLine = `${signalColor}${rec.side === "UP" ? "▲ BUY UP" : "▼ BUY DOWN"}${ANSI.reset} (${rec.phase} ENTRY)`;
-          }
-      }
-
-      const strengthColor = rec.strength === "STRONG" ? ANSI.green : rec.strength === "GOOD" ? ANSI.yellow : ANSI.gray;
-      const edgeValue = rec.edge !== null ? formatPct(rec.edge, 1) : "0%";
-      const filled = Math.min(10, Math.max(0, Math.floor((rec.edge || 0) * 50)));
-      const convictionBar = `[${strengthColor}${"█".repeat(filled)}${ANSI.gray}${"░".repeat(10 - filled)}${ANSI.reset}]`;
-
-      const strengthLine = rec.action === "ENTER"
-        ? `${strengthColor}${rec.strength}${ANSI.reset} ${convictionBar} ${edgeValue}`
-        : "-";
-
-      let adviceLine = `${ANSI.gray}Analyzing market momentum...${ANSI.reset}`;
-      if (timeLeftMin !== null && timeLeftMin < 2) {
-        adviceLine = `${ANSI.yellow}⚠️ LATE STAGE: Volatility high. Avoid new entries.${ANSI.reset}`;
-      } else if (rec.action === "ENTER") {
-        if (blockingReason) {
-            adviceLine = `${ANSI.red}Trade blocked. Resolve: ${blockingReason}${ANSI.reset}`;
-        } else if (signalState.lastSide && signalState.lastSide !== rec.side && (Date.now() - signalState.lastTime < 600000)) {
-          adviceLine = `${ANSI.lightRed}🚨 REVERSAL: Close previous ${signalState.lastSide} position NOW!${ANSI.reset}`;
-        } else {
-          adviceLine = rec.side === "UP" ? "Bullish edge detected. Look for entry." : "Bearish edge detected. Look for entry.";
-        }
-        if (!blockingReason) {
-             signalState.lastSide = rec.side;
-             signalState.lastTime = Date.now();
-        }
-      } else if (signalState.lastSide) {
-        adviceLine = `${ANSI.gray}Previous signal (${signalState.lastSide}) weakened.${ANSI.reset}`;
-      }
-
-      const spreadUp = poly.ok ? poly.orderbook.up.spread : null;
-      const spreadDown = poly.ok ? poly.orderbook.down.spread : null;
-
-      const spread = spreadUp !== null && spreadDown !== null ? Math.max(spreadUp, spreadDown) : (spreadUp ?? spreadDown);
-      const liquidity = poly.ok
-        ? (Number(poly.market?.liquidityNum) || Number(poly.market?.liquidity) || null)
-        : null;
-
-
-
-      const currentPriceBaseLine = colorPriceLine({
-        label: "CURRENT PRICE",
-        price: currentPrice,
-        prevPrice: prevCurrentPrice,
-        decimals: 2,
-        prefix: "$"
-      });
-
-      const ptbDelta = (currentPrice !== null && priceToBeat !== null && Number.isFinite(currentPrice) && Number.isFinite(priceToBeat))
-        ? currentPrice - priceToBeat
-        : null;
-      const ptbDeltaColor = ptbDelta === null
-        ? ANSI.gray
-        : ptbDelta > 0
-          ? ANSI.green
-          : ptbDelta < 0
-            ? ANSI.red
-            : ANSI.gray;
-      const ptbDeltaText = ptbDelta === null
-        ? `${ANSI.gray}-${ANSI.reset}`
-        : `${ptbDeltaColor}${ptbDelta > 0 ? "+" : ptbDelta < 0 ? "-" : ""}$${Math.abs(ptbDelta).toFixed(2)}${ANSI.reset}`;
-      const currentPriceValue = currentPriceBaseLine.split(": ")[1] ?? currentPriceBaseLine;
-      const currentPriceLine = kv("CURRENT PRICE:", `${currentPriceValue} (${ptbDeltaText})`);
-
-      if (poly.ok && poly.market && priceToBeatState.value === null) {
-        const slug = safeFileSlug(poly.market.slug || poly.market.id || "market");
-        if (slug && !dumpedMarkets.has(slug)) {
-          dumpedMarkets.add(slug);
-          try {
-            fs.mkdirSync("./logs", { recursive: true });
-            fs.writeFileSync(path.join("./logs", `polymarket_market_${slug}.json`), JSON.stringify(poly.market, null, 2), "utf8");
-          } catch {
-            // ignore
-          }
-        }
-      }
-
-      const binanceSpotBaseLine = colorPriceLine({ label: "BTC (Binance)", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" });
-      const diffLine = (spotPrice !== null && currentPrice !== null && Number.isFinite(spotPrice) && Number.isFinite(currentPrice) && currentPrice !== 0)
-        ? (() => {
-          const diffUsd = spotPrice - currentPrice;
-          const diffPct = (diffUsd / currentPrice) * 100;
-          const sign = diffUsd > 0 ? "+" : diffUsd < 0 ? "-" : "";
-          return ` (${sign}$${Math.abs(diffUsd).toFixed(2)}, ${sign}${Math.abs(diffPct).toFixed(2)}%)`;
-        })()
-        : "";
-      const binanceSpotLine = `${binanceSpotBaseLine}${diffLine}`;
-      const binanceSpotValue = binanceSpotLine.split(": ")[1] ?? binanceSpotLine;
-      const binanceSpotKvLine = kv("BTC (Binance):", binanceSpotValue);
-
-      const titleLine = poly.ok ? `${poly.market?.question ?? "-"}` : "-";
-      const marketLine = kv("Market:", poly.ok ? (poly.market?.slug ?? "-") : "-");
-
-      const timeColor = timeLeftMin >= 10 && timeLeftMin <= 15
-        ? ANSI.green
-        : timeLeftMin >= 5 && timeLeftMin < 10
-          ? ANSI.yellow
-          : timeLeftMin >= 0 && timeLeftMin < 5
-            ? ANSI.red
-            : ANSI.reset;
-      const timeLeftLine = `⏱ Time left: ${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`;
-
-      const polyTimeLeftColor = settlementLeftMin !== null
-        ? (settlementLeftMin >= 10 && settlementLeftMin <= 15
-          ? ANSI.green
-          : settlementLeftMin >= 5 && settlementLeftMin < 10
-            ? ANSI.yellow
-            : settlementLeftMin >= 0 && settlementLeftMin < 5
-              ? ANSI.red
-              : ANSI.reset)
-        : ANSI.reset;
-
-      const totalEquityLine = (() => {
-        const currentPnL = paperPnL || 0;
-        const totalEquity = paper.state.balance + (paper.state.position ? currentPnL : 0);
-        const lifetimePnL = totalEquity - CONFIG.paper.initialBalance;
-        const lifetimeColor = lifetimePnL >= 0 ? ANSI.green : ANSI.red;
-        const sign = lifetimePnL >= 0 ? "+" : "-";
-        
-        return kv("Total Equity:", `$${formatNumber(totalEquity, 2)} (${lifetimeColor}${sign}$${Math.abs(lifetimePnL).toFixed(2)}${ANSI.reset})`);
-      })();
-
-      const paperBalanceLine = kv("Paper Balance:", `$${formatNumber(paper.state.balance, 2)} ` + (paper.state.position
-         ? `(${paper.state.position.side} ${formatNumber(paper.state.position.shares, 1)}sh)`
-         : "(Flat)")
-         + (paperPnL !== null ? ` ${paperPnL >= 0 ? ANSI.green : ANSI.red}(Pos PnL: ${paperPnL >= 0 ? "+" : ""}$${paperPnL.toFixed(2)})${ANSI.reset}` : "")
-      );
-
-      const dailyPnlLine = (() => {
-         const loss = paper.state.dailyLoss || 0;
-         const pnl = -loss;
-         const color = pnl >= 0 ? ANSI.green : ANSI.red;
-         const sign = pnl >= 0 ? "+" : "-";
-         return kv("Daily PnL:", `${color}${sign}$${Math.abs(pnl).toFixed(2)}${ANSI.reset} (Loss Limit: $${CONFIG.paper.dailyLossLimit})`);
-      })();
-
-      // WIN RATE
-      const [winStats, recentTrades] = await Promise.all([
-        getWinStats(),
-        getRecentTrades(10)
-      ]);
-      const winValues = (() => {
-        const { totalAll, winsAll, totalToday, winsToday } = winStats;
-        
-        const rateAll = totalAll > 0 ? (winsAll / totalAll) * 100 : 0;
-        const rateToday = totalToday > 0 ? (winsToday / totalToday) * 100 : 0;
-
-        const colorAll = rateAll >= 50 ? ANSI.green : rateAll > 0 ? ANSI.red : ANSI.gray;
-        const colorToday = rateToday >= 50 ? ANSI.green : rateToday > 0 ? ANSI.red : ANSI.gray;
-
-        // Overall: 65% (13/20) | Today: 100% (2/2)
-        const strAll = `${colorAll}${rateAll.toFixed(0)}%${ANSI.reset} (${winsAll}/${totalAll})`;
-        const strToday = `${colorToday}${rateToday.toFixed(0)}%${ANSI.reset} (${winsToday}/${totalToday})`;
-
-        return `Overall ${strAll} | Today ${strToday}`;
-      })();
-      const winRateLine = kv("Win Rate:", winValues);
-
-      const lines = [
-        titleLine,
-        marketLine,
-        kv("Time left:", `${timeColor}${fmtTimeLeft(timeLeftMin)}${ANSI.reset}`),
-        "",
-        sepLine(),
-        "",
-        kv("TA Predict:", predictValue),
-        kv("Heiken Ashi:", heikenLine.split(": ")[1] ?? heikenLine),
-        kv("RSI:", rsiLine.split(": ")[1] ?? rsiLine),
-        kv("MACD:", macdLine.split(": ")[1] ?? macdLine),
-        kv("Delta 1/3:", deltaLine.split(": ")[1] ?? deltaLine),
-        kv("VWAP:", vwapLine.split(": ")[1] ?? vwapLine),
-        "",
-        sepLine(),
-        "",
-        section("─ SIGNAL & DECISION ─"),
-        kv("SIGNAL:", signalLine),
-        kv("CONVICTION:", strengthLine),
-        kv("ADVICE:", adviceLine),
-        "",
-        sepLine(),
-        "",
-        section("─ PAPER ACCOUNT ─"),
-        totalEquityLine,
-        paperBalanceLine,
-        dailyPnlLine,
-        winRateLine,
-        "",
-        sepLine(),
-        "",
-        kv("POLYMARKET:", polyHeaderValue),
-        liquidity !== null ? kv("Liquidity:", formatNumber(liquidity, 0)) : null,
-        settlementLeftMin !== null ? kv("Time left:", `${polyTimeLeftColor}${fmtTimeLeft(settlementLeftMin)}${ANSI.reset}`) : null,
-        priceToBeat !== null ? kv("Price to Beat:", `$${formatNumber(priceToBeat, 2)}`) : kv("Price to Beat:", `${ANSI.gray}Waiting for start...${ANSI.reset}`),
-        currentPriceLine,
-        "",
-        sepLine(),
-        "",
-        binanceSpotKvLine,
-        "",
-        sepLine(),
-        "",
-        section("─ ACTIVITY FEED ─"),
-        ...activityLog,
-        "",
-        sepLine(),
-        centerText(`${ANSI.dim}${ANSI.gray}created by @krajekis${ANSI.reset}`, screenWidth())
-      ].filter((x) => x !== null);
-
-      renderScreen(lines.join("\n"));
-
-      // --- BROADCAST TO WEB UI ---
       broadcast({
         type: "state",
         payload: {
-          marketName: poly.ok ? (poly.market?.question || poly.market?.title) : "Polymarket Active",
-          marketSlug: poly.ok ? poly.market?.slug : "-",
-          timeLeftStr: fmtTimeLeft(timeLeftMin),
-          timeLeftMin: timeLeftMin,
+          marketName: "Polymarket Active", 
+          marketSlug: priceToBeatState.slug || "loading...", 
+          timeLeftStr: fmtTimeLeft(analysis.timeLeftMin ?? timing.remainingMinutes),
+          timeLeftMin: analysis.timeLeftMin ?? timing.remainingMinutes,
           etTime: fmtEtTime(new Date()),
-          session: getBtcSession(new Date()),
           
-          side: rec.side,
-          phase: rec.phase,
-          conviction: rec.edge || 0,
-          advice: stripAnsi(adviceLine),
+          side: analysis.rec?.side || "NEUTRAL",
+          phase: analysis.rec?.phase || "-",
+          conviction: analysis.rec?.probability || 0,
+          advice: analysis.adviceLine || "Initializing...",
           
           binancePrice: spotPrice,
           currentPrice: currentPrice,
           strikePrice: priceToBeat,
-          gap: gap,
-          polyUp: marketUp,
-          polyDown: marketDown,
+          gap: uiGap, 
           
-          totalEquity: paper.state.balance + (paper.state.position ? paperPnL : 0),
+          polyUp: analysis.marketUp ?? null,
+          polyDown: analysis.marketDown ?? null,
+          
+          // USE REALTIME VALUES
+          totalEquity: rtEquity,
           dailyPnl: -(paper.state.dailyLoss || 0),
           paperBalance: paper.state.balance,
-          winStats: {
-            overall: {
-              rate: Number(winStats.totalAll) > 0 ? (Number(winStats.winsAll) / Number(winStats.totalAll)) * 100 : 0,
-              wins: Number(winStats.winsAll),
-              total: Number(winStats.totalAll)
-            },
-            today: {
-              rate: Number(winStats.totalToday) > 0 ? (Number(winStats.winsToday) / Number(winStats.totalToday)) * 100 : 0,
-              wins: Number(winStats.winsToday),
-              total: Number(winStats.totalToday)
-            }
-          },
           
           position: paper.state.positions && paper.state.positions.length > 0 ? paper.state.positions[0] : null,
-          posPnl: paperPnL,
+          posPnl: rtPnl,
           
-          indHeiken: { val: heikenValue, sentiment: haNarrative === "LONG" ? "LONG" : haNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
-          indRsi: { val: rsiValue, sentiment: rsiNarrative === "LONG" ? "LONG" : rsiNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
-          indMacd: { val: macdLabel, sentiment: macdNarrative === "LONG" ? "LONG" : macdNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
-          indVwap: { val: vwapValue, sentiment: vwapNarrative === "LONG" ? "LONG" : vwapNarrative === "SHORT" ? "SHORT" : "NEUTRAL" },
-          indEma: { val: emaLabel, sentiment: emaTrend === "RISING" ? "LONG" : emaTrend === "FALLING" ? "SHORT" : "NEUTRAL" },
-          recentTrades: recentTrades
+          // Indicators (Slow update is fine)
+          indHeiken: { val: analysis.heikenValue, sentiment: analysis.haNarrative },
+          indRsi: { val: analysis.rsiValue, sentiment: analysis.rsiNarrative },
+          indMacd: { val: analysis.macdLabel, sentiment: analysis.macdNarrative },
+          indVwap: { val: analysis.vwapValue, sentiment: analysis.vwapNarrative },
+          indEma: { val: analysis.emaLabel, sentiment: analysis.emaTrend === "RISING" ? "LONG" : analysis.emaTrend === "FALLING" ? "SHORT" : "NEUTRAL" },
+          
+          recentTrades: recentTrades,
+          winStats: analysis.winStats ? {
+            today: { 
+              wins: analysis.winStats.winsToday || 0, 
+              total: analysis.winStats.totalToday || 0, 
+              rate: (analysis.winStats.winsToday / analysis.winStats.totalToday) * 100 || 0 
+            },
+            overall: { 
+              wins: analysis.winStats.winsAll || 0, 
+              total: analysis.winStats.totalAll || 0, 
+              rate: (analysis.winStats.winsAll / analysis.winStats.totalAll) * 100 || 0 
+            }
+          } : {
+            today: { wins: 0, total: 0, rate: 0 },
+            overall: { wins: 0, total: 0, rate: 0 }
+          }
         }
       });
 
+      // --- TERMINAL RENDERING ---
+      if (process.stdout.isTTY) {
+          const W = screenWidth();
+          let out = "";
+          out += `${sepLine("═")}\n`;
+          out += `${centerText(`${ANSI.green}POLYBOT DASHBOARD${ANSI.reset} | ${fmtEtTime()} ET`, W)}\n`;
+          out += `${sepLine("═")}\n\n`;
+
+          out += `${section("MARKET STATUS")}\n`;
+          out += `${kv("Market", (priceToBeatState.slug || "Loading...").slice(0, 30))}\n`;
+          out += `${kv("Time Left", fmtTimeLeft(analysis.timeLeftMin ?? timing.remainingMinutes))}\n`;
+          out += `${kv("Session", getBtcSession())}\n\n`;
+
+          out += `${section("PRICES")}\n`;
+          out += `${colorPriceLine({ label: "Binance Spot", price: spotPrice, prevPrice: prevSpotPrice, decimals: 0, prefix: "$" })}\n`;
+          out += `${colorPriceLine({ label: "Current (CL)", price: currentPrice, prevPrice: prevCurrentPrice, decimals: 2, prefix: "$" })}\n`;
+          out += `${kv("Strike Price", priceToBeat !== null ? `$${formatNumber(priceToBeat, 2)}` : "-")}\n`;
+          
+          if (uiGap !== null) {
+              const gapColor = uiGap > 0 ? ANSI.green : uiGap < 0 ? ANSI.red : ANSI.gray;
+              out += `${kv("Gap to Beat", `${gapColor}${uiGap > 0 ? "+" : ""}${uiGap.toFixed(2)}${ANSI.reset}`)}\n`;
+          }
+          out += "\n";
+
+          out += `${section("INDICATORS")}\n`;
+          out += `${kv("Heikin Ashi", colorByNarrative(analysis.heikenValue || "-", analysis.haNarrative))}\n`;
+          out += `${kv("RSI (14m)", colorByNarrative(analysis.rsiValue || "-", analysis.rsiNarrative))}\n`;
+          out += `${kv("MACD", colorByNarrative(analysis.macdLabel || "-", analysis.macdNarrative))}\n`;
+          out += `${kv("VWAP", colorByNarrative(analysis.vwapValue || "-", analysis.vwapNarrative))}\n`;
+          out += `${kv("EMA 21", colorByNarrative(analysis.emaLabel || "-", analysis.emaTrend === "RISING" ? "LONG" : "SHORT"))}\n\n`;
+
+          out += `${section("POSITION / PNL")}\n`;
+          if (paper.state.positions && paper.state.positions.length > 0) {
+              const pos = paper.state.positions[0];
+              const pnlColor = rtPnl >= 0 ? ANSI.green : ANSI.red;
+              out += `${kv("Active Pos", `${pos.side} @ ${pos.entryPrice.toFixed(2)}`)}\n`;
+              out += `${kv("Unrealized", `${pnlColor}${rtPnl >= 0 ? "+" : "-"}$${Math.abs(rtPnl).toFixed(2)}${ANSI.reset}`)}\n`;
+          } else {
+              out += `${kv("Active Pos", "NONE")}\n`;
+          }
+          out += `${kv("Account Bal", `$${paper.state.balance.toFixed(2)}`)}\n`;
+          const dPnl = -(paper.state.dailyLoss || 0);
+          const dPnlColor = dPnl >= 0 ? ANSI.green : ANSI.red;
+          out += `${kv("Daily P&L", `${dPnlColor}${dPnl >= 0 ? "+" : "-"}$${Math.abs(dPnl).toFixed(2)}${ANSI.reset}`)}\n`;
+          
+          if (analysis.winStats) {
+              const tw = analysis.winStats.winsToday;
+              const tt = analysis.winStats.totalToday;
+              const tr = tt > 0 ? (tw / tt) * 100 : 0;
+              out += `${kv("Win Rate", `${tr.toFixed(0)}% (${tw}/${tt})`)}\n`;
+          }
+          out += "\n";
+
+          out += `${section("RECENT ACTIVITY")}\n`;
+          const logs = activityLog.slice(-5);
+          for (const log of logs) {
+              out += `${log}\n`;
+          }
+
+          renderScreen(out);
+      }
+
       prevSpotPrice = spotPrice ?? prevSpotPrice;
       prevCurrentPrice = currentPrice ?? prevCurrentPrice;
+      consecutiveErrors = 0;
 
-      await logSignalToDb({
-        entry_minute: timing.elapsedMinutes,
-        time_left_min: timeLeftMin,
-        regime: regimeInfo.regime,
-        signal: signal,
-        model_up: timeAware.adjustedUp,
-        model_down: timeAware.adjustedDown,
-        mkt_up: marketUp,
-        mkt_down: marketDown,
-        edge_up: edge.edgeUp,
-        edge_down: edge.edgeDown,
-        recommendation: rec.action === "ENTER" ? `${rec.side}:${rec.phase}:${rec.strength}` : "NO_TRADE",
-        price_to_beat: priceToBeat,
-        current_price: lastPrice,
-        binance_price: spotPrice,
-        gap: gap
-      });
-      
-      consecutiveErrors = 0; // Reset on success
-
-    } catch (err) {
-      consecutiveErrors++;
-      pushActivity(`${ANSI.red}ERROR:${ANSI.reset} ${err?.message ?? String(err)} (${consecutiveErrors}/5)`);
-      
-      if (consecutiveErrors >= 5) {
-          pushActivity(`${ANSI.red}CRITICAL: Too many consecutive errors. Exiting...${ANSI.reset}`);
-          process.exit(1);
+      } catch (err) {
+      if (err.message && (err.message.includes("fetch failed") || err.message.includes("network") || err.message.includes("ETIMEDOUT") || err.message.includes("ECONNRESET") || err.message.includes("aborted"))) {
+          // Warning only
+          pushActivity(`${ANSI.yellow}WARN: Network glitch (${err.message}). Retrying...${ANSI.reset}`);
+      } else if (err.message && err.message.includes("SQLITE_CANTOPEN")) {
+          // Warning only for database busy errors
+          pushActivity(`${ANSI.yellow}WARN: Database busy. Retrying...${ANSI.reset}`);
+      } else {
+          // Critical
+          consecutiveErrors++;
+          pushActivity(`${ANSI.red}ERROR:${ANSI.reset} ${err?.message ?? String(err)} (${consecutiveErrors}/10)`);
+          
+          if (consecutiveErrors >= 10) {
+              pushActivity(`${ANSI.red}CRITICAL: Too many consecutive errors. Exiting...${ANSI.reset}`);
+              process.exit(1);
+          }
       }
     }
 
-    await sleep(CONFIG.pollIntervalMs);
+    tickCount++;
+    await sleep(LOOP_INTERVAL_MS);
 
-    // Manual Garbage Collection (Safety Valve)
-    // Run every ~60 seconds (assuming 1s sleep + other work)
-    if (global.gc && Date.now() % 60000 < 2000) {
-       try {
-         // console.log("Running manual Garbage Collection...");
-         global.gc(); 
-       } catch (e) {
-         // ignore
-       }
+    if (global.gc && tickCount % 240 === 0) {
+       try { global.gc(); } catch (e) {}
     }
   }
 }

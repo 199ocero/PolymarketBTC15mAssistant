@@ -114,6 +114,12 @@ document.addEventListener('DOMContentLoaded', () => {
         elements.convictionPct.textContent = `${(conv * 100).toFixed(0)}%`;
         elements.convictionProgress.style.width = `${conv * 100}%`;
         
+        // Hide conviction if no signal
+        const convContainer = elements.convictionPct.closest('.conviction-container');
+        if (convContainer) {
+            convContainer.style.display = side === 'NEUTRAL' ? 'none' : 'block';
+        }
+        
         // Dynamic Signal Card Coloring
         const signalCard = elements.signalSide.closest('.card');
         if (signalCard) {
@@ -124,12 +130,33 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Prices
         updatePrice(elements.binancePrice, state.binancePrice, 0, '$');
-        updatePrice(elements.currentPrice, state.currentPrice, 2, '$');
+
+        // Color Current Price based on Relation to Strike (Gap)
+        const cPrice = state.currentPrice;
+        const sPrice = state.strikePrice;
+        
+        // Update Price Text
+        updatePrice(elements.currentPrice, cPrice, 2, '$');
+        
+        // Dynamic Coloring
+        if (cPrice !== null && sPrice !== null) {
+            elements.currentPrice.classList.remove('text-green', 'text-red', 'text-neutral');
+            if (cPrice > sPrice) {
+                 elements.currentPrice.style.color = 'var(--accent-green)'; // Winning UP
+            } else if (cPrice < sPrice) {
+                 elements.currentPrice.style.color = 'var(--accent-red)';   // Winning DOWN
+            } else {
+                 elements.currentPrice.style.color = 'var(--text-primary)';
+            }
+        }
+        
         updatePrice(elements.strikePrice, state.strikePrice, 2, '$');
         
         if (state.gap !== undefined && elements.priceGap) {
-            elements.priceGap.textContent = (state.gap >= 0 ? '+' : '') + '$' + state.gap.toFixed(2);
-            elements.priceGap.style.color = state.gap >= 0 ? 'var(--accent-green)' : 'var(--accent-red)';
+            const gapVal = state.gap;
+            const sign = gapVal > 0 ? '+' : gapVal < 0 ? '-' : '';
+            elements.priceGap.textContent = `(${sign}$${Math.abs(gapVal).toFixed(2)})`;
+            elements.priceGap.style.color = gapVal > 0 ? 'var(--accent-green)' : gapVal < 0 ? 'var(--accent-red)' : 'var(--text-secondary)';
         }
 
         if (elements.polyUp) elements.polyUp.textContent = state.polyUp !== null ? `${state.polyUp}¢` : '--¢';

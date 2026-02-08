@@ -120,7 +120,8 @@ async function runBacktest() {
             rsi,
             macd,
             heikinAshi: consec,
-            vwap
+            vwap,
+            candles: relevantCandles // Pass history
         }
     };
 
@@ -144,6 +145,14 @@ async function runBacktest() {
   }
 }
 
+function calculateFee(amount, price) {
+    if (CONFIG.paper.usePolymarketDynamicFees) {
+        // Polymarket Formula: fee = amount * 0.25 * (price * (1 - price))^2
+        return amount * 0.25 * Math.pow(price * (1 - price), 2);
+    }
+    return amount * (CONFIG.paper.feePct / 100);
+}
+
 function updatePaperTrader(rec, row, price) {
     const { positions } = paperState;
     const timeLeftMin = row.time_left_min;
@@ -155,46 +164,61 @@ function updatePaperTrader(rec, row, price) {
         
         if (!marketOdds) continue;
 
-        const pnlRaw = (marketOdds * pos.shares) - pos.amount;
-        // const roi = pnlRaw / pos.amount;
+        const roiPct = ((marketOdds - pos.entryPrice) / pos.entryPrice) * 100;
         
         let shouldExit = false;
         let reason = "";
 
-        // Strategy Specific Exits
-        if (pos.strategy === "MOMENTUM") {
-            const priceGain = marketOdds - pos.entryPrice;
-            if (priceGain >= 0.15) { shouldExit = true; reason = "TP_MOM (15c)"; }
-            if (timeLeftMin <= 2) { shouldExit = true; reason = "TIME 2m"; }
-        } else if (pos.strategy === "MEAN_REVERSION") {
-            if (marketOdds >= 0.50) { shouldExit = true; reason = "TP_REV (50c)"; }
-            if (timeLeftMin <= 3) { shouldExit = true; reason = "TIME 3m"; }
-        } else if (pos.strategy === "LATE_WINDOW") {
-            // Hold
+        // Time Guard
+        const isLateWindow = pos.strategy === "LATE_WINDOW";
+        const timeGuard = isLateWindow ? 0.5 : (CONFIG.paper.timeGuardMinutes || 2); 
+        
+        if (timeLeftMin <= timeGuard) {
+             shouldExit = true;
+             reason = `TIME_GUARD_EXIT (<${timeGuard}m)`;
         }
 
-        // Global Stop Loss (approx -40%)
-        // If current odds < 0.6 * entry?
-        if (marketOdds < pos.entryPrice * 0.6) { shouldExit = true; reason = "STOP -40%"; }
+        // SL
+        if (!shouldExit && roiPct <= -CONFIG.paper.stopLossRoiPct) {
+            shouldExit = true;
+            reason = `STOP_LOSS (${roiPct.toFixed(1)}%)`;
+        }
+
+        // TP
+        if (!shouldExit) {
+            if (pos.strategy === "MOMENTUM") {
+                if (roiPct >= (CONFIG.paper.momentumTakeProfitRoiPct || 50)) {
+                    shouldExit = true;
+                    reason = `TP_MOMENTUM (+${roiPct.toFixed(1)}%)`;
+                }
+            } else if (pos.strategy === "MEAN_REVERSION") {
+                if (marketOdds >= 0.50) {
+                    shouldExit = true;
+                    reason = `TP_MEAN_REV (Price > 50¢)`;
+                }
+            } else if (roiPct >= CONFIG.paper.takeProfitRoiPct) {
+                shouldExit = true;
+                reason = `TAKE_PROFIT_LEGACY`;
+            }
+        }
         
         // Expiry?
         if (timeLeftMin <= 0) {
-             shouldExit = true; reason = "EXPIRY";
+             shouldExit = true;
+             reason = "EXPIRY";
              const win = pos.side === "UP" ? (price >= row.price_to_beat) : (price < row.price_to_beat);
-             // If win, odds = 1. If loss, odds = 0.
              const finalOdds = win ? 1.0 : 0.0;
-             // Re-calc pnl based on final
-             const finalValue = finalOdds * pos.shares;
-             const finalPnl = finalValue - pos.amount;
+             const proceeds = finalOdds * pos.shares;
+             const pnl = proceeds - pos.amount;
              
-             paperState.balance += finalValue;
+             paperState.balance += proceeds;
              paperState.trades.push({
                 type: "EXIT",
                 strategy: pos.strategy,
                 side: pos.side,
                 entry: pos.entryPrice.toFixed(2),
                 exit: finalOdds.toFixed(2),
-                pnl: finalPnl,
+                pnl: pnl,
                 reason
             });
             positions.splice(i, 1);
@@ -202,10 +226,12 @@ function updatePaperTrader(rec, row, price) {
         }
 
         if (shouldExit) {
-            // Close
-            const exitValue = marketOdds * pos.shares;
-            const pnl = exitValue - pos.amount;
-            paperState.balance += exitValue;
+            let proceeds = marketOdds * pos.shares;
+            const fee = calculateFee(proceeds, marketOdds);
+            proceeds -= fee;
+            const pnl = proceeds - pos.amount;
+
+            paperState.balance += proceeds;
             paperState.trades.push({
                 type: "EXIT",
                 strategy: pos.strategy,
@@ -221,25 +247,28 @@ function updatePaperTrader(rec, row, price) {
 
     // 2. Check Entries
     if (rec.action === "ENTER") {
-        if (positions.length < 2) {
+        const maxPos = CONFIG.paper.maxConcurrentPositions || 2;
+        if (positions.length < maxPos) {
              const odds = rec.side === "UP" ? row.mkt_up : row.mkt_down;
-             
-             // Price Guard (0.40 - 0.60)
-             if (odds < 0.40 || odds > 0.60) {
-                 // console.log("Skipping entry due to price filter:", odds);
-                 return; 
-             }
+             if (odds === null || odds === undefined || odds <= 0 || odds >= 1) return;
 
-             // Basic amount $5
-             const amount = 5;
-             if (odds && paperState.balance >= amount) {
-                 paperState.balance -= amount;
+             let tradeAmount = CONFIG.paper.maxBet; 
+             if (rec.strategy === "LATE_WINDOW") tradeAmount = 5;
+             else if (rec.strategy === "MOMENTUM") tradeAmount = 4;
+             else if (rec.strategy === "MEAN_REVERSION") tradeAmount = 3;
+             else tradeAmount = CONFIG.paper.minBet;
+
+             const fee = calculateFee(tradeAmount, odds);
+             const totalCost = tradeAmount + fee;
+
+             if (paperState.balance >= totalCost) {
+                 paperState.balance -= totalCost;
                  positions.push({
                      side: rec.side,
                      strategy: rec.strategy,
                      entryPrice: odds,
-                     amount: amount,
-                     shares: amount / odds
+                     amount: totalCost,
+                     shares: tradeAmount / odds
                  });
              }
         }

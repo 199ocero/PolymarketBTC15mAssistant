@@ -1,0 +1,22 @@
+{
+  "balance": 86.474510001271,
+  "positions": [],
+  "dailyLoss": -10.42612129547612,
+  "lastStopLossTime": 1770594985378,
+  "recentResults": [
+    "LOSS",
+    "LOSS",
+    "WIN",
+    "WIN",
+    "WIN",
+    "WIN",
+    "WIN",
+    "WIN",
+    "LOSS",
+    "LOSS"
+  ],
+  "lastDailyReset": 1770558684914,
+  "lastExitTime": 1770594985380,
+  "lastEntryTime": 1770594388829,
+  "consecutiveLosses": 2
+}

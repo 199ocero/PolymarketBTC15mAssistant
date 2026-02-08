@@ -18,11 +18,11 @@ export const CONFIG = {
   // Strategy Specifics
   strategy: {
     momentum: {
-      rsiMin: 50,
-      rsiMax: 70, // for Uptrend check
-      rsiMinDown: 30, 
-      rsiMaxDown: 50, // for Downtrend check
-      minOddsEdge: 0.10, // 10%
+      rsiMin: 55,
+      rsiMax: 65, // for Uptrend check
+      rsiMinDown: 35, 
+      rsiMaxDown: 45, // for Downtrend check (symmetrical tightly around 50)
+      minOddsEdge: 0.15, // 15%
     },
     meanReversion: {
       rsiOverbought: 65,
@@ -31,9 +31,9 @@ export const CONFIG = {
       minTimeRemaining: 7,
     },
     lateWindow: {
-      maxTimeRemaining: 3,
-      minTimeRemaining: 1,
-      minOdds: 0.90, // safe barrier, if < 90% and good signal
+      maxTimeRemaining: 1.5, // 90 seconds
+      minTimeRemaining: 1.0, // 60 seconds
+      minOdds: 0.85, // safe barrier
     }
   },
 
@@ -71,16 +71,26 @@ export const CONFIG = {
     // Hard stop -40%
     stopLossRoiPct: 40.0, 
     takeProfitRoiPct: 100.0, // High ceiling, strategy exits logic handles dynamic TP (15c, 20c gain etc)
+    momentumTakeProfitRoiPct: 50.0, // Target ROI for Momentum Strategy
     
     // Limits
-    maxTradesPerDay: 12,
-    dailyLossLimit: 15.0, // -$15
+    maxTradesPerDay: 50,
+    dailyLossLimit: 15.0, // Deprecated - replaced by dailyLossLimitPct
+    dailyLossLimitPct: 30.0, // 30% of fund
     
+    // Kelly Criterion
+    useKelly: true,
+    kellyFraction: 0.5, // Half-Kelly for stability
+    minKellyBet: 3, // $3
+    maxKellyBet: 5, // $5 (per trade position size)
+
     // Misc
     breakevenTriggerRoiPct: 10.0, // maybe keep generic
     timeGuardMinutes: 2, // "Exit all positions with 2 mins remaining"
+    resolutionThreshold: 0.95, // Exit skip threshold (95 cents or 5 cents)
+    resolutionWindowMin: 1.5, // 90 seconds
     
-    entryCooldownSeconds: 180, // "Wait at least 3 minutes between entering new trades"
+    entryCooldownSeconds: 45, // "Wait at least 45 seconds between entering new trades"
     stopLossGracePeriodSeconds: 15,
   },
   discord: {

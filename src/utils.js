@@ -5,6 +5,23 @@ export function clamp(x, min, max) {
   return Math.max(min, Math.min(max, x));
 }
 
+export async function fetchWithTimeout(resource, options = {}) {
+  const { timeout = 5000 } = options;
+  
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  
+  try {
+    const response = await fetch(resource, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

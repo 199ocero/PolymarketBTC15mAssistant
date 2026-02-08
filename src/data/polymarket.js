@@ -1,4 +1,5 @@
 import { CONFIG } from "../config.js";
+import { fetchWithTimeout } from "../utils.js";
 
 function toNumber(x) {
   const n = Number(x);
@@ -9,7 +10,7 @@ export async function fetchMarketBySlug(slug) {
   const url = new URL("/markets", CONFIG.gammaBaseUrl);
   url.searchParams.set("slug", slug);
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 5000 });
   if (!res.ok) {
     throw new Error(`Gamma markets error: ${res.status} ${await res.text()}`);
   }
@@ -29,7 +30,7 @@ export async function fetchMarketsBySeriesSlug({ seriesSlug, limit = 50 }) {
   url.searchParams.set("enableOrderBook", "true");
   url.searchParams.set("limit", String(limit));
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 5000 });
   if (!res.ok) {
     throw new Error(`Gamma markets(series) error: ${res.status} ${await res.text()}`);
   }
@@ -45,7 +46,7 @@ export async function fetchLiveEventsBySeriesId({ seriesId, limit = 20 }) {
   url.searchParams.set("closed", "false");
   url.searchParams.set("limit", String(limit));
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 5000 });
   if (!res.ok) {
     throw new Error(`Gamma events(series_id) error: ${res.status} ${await res.text()}`);
   }
@@ -73,7 +74,7 @@ export async function fetchActiveMarkets({ limit = 200, offset = 0 } = {}) {
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("offset", String(offset));
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 5000 });
   if (!res.ok) {
     throw new Error(`Gamma markets(active) error: ${res.status} ${await res.text()}`);
   }
@@ -146,7 +147,7 @@ export async function fetchClobPrice({ tokenId, side }) {
   url.searchParams.set("token_id", tokenId);
   url.searchParams.set("side", side);
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 3000 });
   if (!res.ok) {
     throw new Error(`CLOB price error: ${res.status} ${await res.text()}`);
   }
@@ -158,7 +159,7 @@ export async function fetchOrderBook({ tokenId }) {
   const url = new URL("/book", CONFIG.clobBaseUrl);
   url.searchParams.set("token_id", tokenId);
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 4000 });
   if (!res.ok) {
     throw new Error(`CLOB book error: ${res.status} ${await res.text()}`);
   }

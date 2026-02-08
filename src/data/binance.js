@@ -1,4 +1,5 @@
 import { CONFIG } from "../config.js";
+import { fetchWithTimeout } from "../utils.js";
 
 function toNumber(x) {
   const n = Number(x);
@@ -11,7 +12,7 @@ export async function fetchKlines({ interval, limit }) {
   url.searchParams.set("interval", interval);
   url.searchParams.set("limit", String(limit));
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 4000 });
   if (!res.ok) {
     throw new Error(`Binance klines error: ${res.status} ${await res.text()}`);
   }
@@ -31,7 +32,7 @@ export async function fetchKlines({ interval, limit }) {
 export async function fetchLastPrice() {
   const url = new URL("/api/v3/ticker/price", CONFIG.binanceBaseUrl);
   url.searchParams.set("symbol", CONFIG.symbol);
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, { timeout: 3000 });
   if (!res.ok) {
     throw new Error(`Binance last price error: ${res.status} ${await res.text()}`);
   }

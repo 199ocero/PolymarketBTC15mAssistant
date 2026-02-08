@@ -39,6 +39,8 @@ export function computeMacd(closes, fast, slow, signal) {
     macd: macdLine,
     signal: signalLine,
     hist,
-    histDelta: prevHist === null ? null : lastHist - prevHist
+    histDelta: prevHist === null ? null : lastHist - prevHist,
+    histPrev: prevHist,
+    histPrev2: macdSeries.length >= signal + 2 ? (macdSeries[macdSeries.length - 3] - ema(macdSeries.slice(0, macdSeries.length - 2), signal)) : null
   };
 }
